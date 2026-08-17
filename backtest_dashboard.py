@@ -315,6 +315,18 @@ def create_comprehensive_dataframe(price_data, ticker_weights, indicators, depen
     
     return df
 
+def compute_seasonality(series, freq='M'):
+    """Resample to month-end/quarter-end and compute period-over-period nominal (absolute) change,
+    grouped by calendar month or quarter. Uses nominal change rather than % return to match the
+    Nominal_Change convention used elsewhere - dependent_var can be a spread that crosses zero,
+    where percentage returns are meaningless/explosive."""
+    resampled = series.resample(freq).last().dropna()
+    changes = resampled.diff().dropna()
+    period_num = changes.index.month if freq == 'M' else changes.index.quarter
+    period_labels = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'] if freq == 'M' else ['Q1','Q2','Q3','Q4']
+    returns_df = pd.DataFrame({'Change': changes.values, 'Period': period_num, 'Year': changes.index.year})
+    return returns_df, period_labels
+
 # Sidebar Configuration
 st.sidebar.header("Configuration")
 
@@ -465,8 +477,14 @@ with st.sidebar.expander("Cluster-Free Zone", expanded=True):
 # Calculate Button
 calculate_button = st.sidebar.button("Calculate & Plot", type="primary", use_container_width=True)
 
-# Main Content
+# st.button() only returns True on the exact run it's clicked - any later widget interaction
+# (e.g. the Monthly/Quarterly seasonality toggle) reruns the script with it back to False, which
+# would otherwise drop back to the welcome screen. Persist the "calculated" state instead.
 if calculate_button:
+    st.session_state['calculated'] = True
+
+# Main Content
+if st.session_state.get('calculated', False):
     if not ticker_weights or not any(w != 0 for w in ticker_weights.values()):
         st.error("Please add at least one ticker with non-zero weight")
     else:
@@ -727,7 +745,47 @@ if calculate_button:
 
                                 fig_dist_all.update_layout(title="All Signals Forward Return Distributions", template="plotly_dark", height=400, showlegend=False)
                                 st.plotly_chart(fig_dist_all, use_container_width=True)
-                        
+
+                        # Seasonality
+                        st.subheader("Seasonality")
+                        seasonality_freq = st.radio("Timeframe", ["Monthly", "Quarterly"], horizontal=True, key="seasonality_freq")
+                        freq_code = 'M' if seasonality_freq == "Monthly" else 'Q'
+                        period_axis_title = "Month" if freq_code == 'M' else "Quarter"
+
+                        returns_df, period_labels = compute_seasonality(dependent_var, freq_code)
+
+                        if not returns_df.empty:
+                            avg_change = returns_df.groupby('Period')['Change'].mean().reindex(range(1, len(period_labels) + 1))
+                            std_change = returns_df.groupby('Period')['Change'].std().reindex(range(1, len(period_labels) + 1))
+
+                            fig_season_bar = go.Figure(go.Bar(
+                                x=period_labels, y=avg_change.values,
+                                error_y=dict(type='data', array=std_change.values, visible=True),
+                                marker_color=['#26a69a' if v >= 0 else '#ef5350' for v in avg_change.fillna(0).values],
+                                text=avg_change.round(4), texttemplate='%{text}', textposition='outside'
+                            ))
+                            fig_season_bar.update_layout(title=f"Average {seasonality_freq} Nominal Change (± 1 Std Dev)", template="plotly_dark",
+                                                          height=400, xaxis_title=period_axis_title, yaxis_title="Average Nominal Change")
+                            st.plotly_chart(fig_season_bar, use_container_width=True)
+
+                            pivot = returns_df.pivot_table(index='Year', columns='Period', values='Change', aggfunc='mean')
+                            pivot.columns = [period_labels[c - 1] for c in pivot.columns]
+                            avg_row = pd.DataFrame(pivot.mean(axis=0)).T
+                            avg_row.index = ['Average']
+                            pivot_display = pd.concat([avg_row, pivot.sort_index(ascending=False)])
+
+                            fig_season_heat = go.Figure(go.Heatmap(
+                                z=pivot_display.values, x=pivot_display.columns, y=pivot_display.index.astype(str),
+                                text=np.round(pivot_display.values, 4), texttemplate="%{text}",
+                                colorscale='RdYlGn', zmid=0, colorbar=dict(title="Nominal Change")
+                            ))
+                            fig_season_heat.update_layout(title=f"{seasonality_freq} Nominal Change Heatmap by Year", template="plotly_dark",
+                                                           height=600, xaxis_title=period_axis_title, yaxis_title="Year", xaxis_side='top')
+                            fig_season_heat.update_yaxes(autorange='reversed')
+                            st.plotly_chart(fig_season_heat, use_container_width=True)
+                        else:
+                            st.info(f"Not enough history in the selected date range to compute {seasonality_freq.lower()} seasonality.")
+
                         # Time series plot
                         st.subheader("Dependent Variable with Signal Analysis")
                         fig = go.Figure()
