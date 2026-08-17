@@ -320,7 +320,10 @@ def compute_seasonality(series, freq='M'):
     grouped by calendar month or quarter. Uses nominal change rather than % return to match the
     Nominal_Change convention used elsewhere - dependent_var can be a spread that crosses zero,
     where percentage returns are meaningless/explosive."""
-    resampled = series.resample(freq).last().dropna()
+    # pandas deprecated the bare 'M'/'Q' resample aliases in favor of 'ME'/'QE' (removed entirely
+    # in newer pandas) - map our simple 'M'/'Q' param to the modern alias pandas expects.
+    resample_freq = 'ME' if freq == 'M' else 'QE'
+    resampled = series.resample(resample_freq).last().dropna()
     changes = resampled.diff().dropna()
     period_num = changes.index.month if freq == 'M' else changes.index.quarter
     period_labels = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'] if freq == 'M' else ['Q1','Q2','Q3','Q4']
