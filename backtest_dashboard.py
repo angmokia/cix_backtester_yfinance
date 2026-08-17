@@ -79,14 +79,17 @@ def calculate_dependent_variable(data, ticker_weights):
     if not active_tickers:
         return pd.Series(dtype=float), pd.DataFrame()
     
+    # Requires every active ticker to have data - the combined series starts from whichever
+    # component starts LATEST, since a partial combination (e.g. only one leg of a spread)
+    # isn't a meaningful value for the dependent variable.
     ticker_data = data[list(active_tickers.keys())].dropna()
     if len(ticker_data) == 0:
         return pd.Series(dtype=float), pd.DataFrame()
-    
+
     weighted_components = pd.DataFrame(index=ticker_data.index)
     for ticker, weight in active_tickers.items():
         weighted_components[f"{weight:+.1f}×{ticker}"] = weight * ticker_data[ticker]
-    
+
     dependent_var = weighted_components.sum(axis=1)
     result_data = ticker_data.copy()
     for col in weighted_components.columns:
@@ -512,7 +515,17 @@ if st.session_state.get('calculated', False):
                     
                     # Calculate dependent variable
                     dependent_var, result_data = calculate_dependent_variable(price_data, ticker_weights)
-                    
+
+                    # Flag it when components don't all start on the same date, since the combined
+                    # series can only start from whichever component starts LATEST.
+                    active_dep_tickers = {t: w for t, w in ticker_weights.items() if t and w != 0}
+                    ticker_start_dates = {t: price_data[t].dropna().index.min() for t in active_dep_tickers if t in price_data.columns and price_data[t].notna().any()}
+                    if len(set(ticker_start_dates.values())) > 1:
+                        availability_str = " | ".join(f"{t}: from {d.date()}" for t, d in sorted(ticker_start_dates.items(), key=lambda kv: kv[1]))
+                        latest_start = max(ticker_start_dates.values())
+                        st.warning(f"⚠️ Component tickers have different data start dates — {availability_str}. "
+                                   f"The dependent variable requires all components, so it only starts from {latest_start.date()}.")
+
                     if len(dependent_var) > 0:
                         # Evaluate conditions (now returns cumulative sum columns too)
                         matching_mask, condition_results, individual_conditions, rolling_return_columns, cumulative_sum_columns = evaluate_indicator_conditions(price_data, indicators)
