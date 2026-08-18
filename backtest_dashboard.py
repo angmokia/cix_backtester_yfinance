@@ -318,16 +318,20 @@ def create_comprehensive_dataframe(price_data, ticker_weights, indicators, depen
     
     return df
 
-def compute_seasonality(series, freq='M'):
-    """Resample to month-end/quarter-end and compute period-over-period nominal (absolute) change,
-    grouped by calendar month or quarter. Uses nominal change rather than % return to match the
-    Nominal_Change convention used elsewhere - dependent_var can be a spread that crosses zero,
-    where percentage returns are meaningless/explosive."""
+def compute_seasonality(series, freq='M', change_type='nominal'):
+    """Resample to month-end/quarter-end and compute period-over-period change, grouped by
+    calendar month or quarter. change_type='nominal' uses absolute change (matches the
+    Nominal_Change convention used elsewhere - safe even when dependent_var is a spread that
+    crosses zero); change_type='pct' uses % return, which is more intuitive for price-like
+    series but meaningless/explosive if the series crosses or sits near zero."""
     # pandas deprecated the bare 'M'/'Q' resample aliases in favor of 'ME'/'QE' (removed entirely
     # in newer pandas) - map our simple 'M'/'Q' param to the modern alias pandas expects.
     resample_freq = 'ME' if freq == 'M' else 'QE'
     resampled = series.resample(resample_freq).last().dropna()
-    changes = resampled.diff().dropna()
+    if change_type == 'pct':
+        changes = resampled.pct_change().dropna() * 100
+    else:
+        changes = resampled.diff().dropna()
     period_num = changes.index.month if freq == 'M' else changes.index.quarter
     period_labels = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'] if freq == 'M' else ['Q1','Q2','Q3','Q4']
     returns_df = pd.DataFrame({'Change': changes.values, 'Period': period_num, 'Year': changes.index.year})
@@ -764,11 +768,23 @@ if st.session_state.get('calculated', False):
 
                         # Seasonality
                         st.subheader("Seasonality")
-                        seasonality_freq = st.radio("Timeframe", ["Monthly", "Quarterly"], horizontal=True, key="seasonality_freq")
+                        season_col1, season_col2 = st.columns(2)
+                        with season_col1:
+                            seasonality_freq = st.radio("Timeframe", ["Monthly", "Quarterly"], horizontal=True, key="seasonality_freq")
+                        with season_col2:
+                            seasonality_change_type = st.radio("Change Type", ["Nominal", "Percentage"], horizontal=True, key="seasonality_change_type")
                         freq_code = 'M' if seasonality_freq == "Monthly" else 'Q'
+                        change_type_code = 'pct' if seasonality_change_type == "Percentage" else 'nominal'
                         period_axis_title = "Month" if freq_code == 'M' else "Quarter"
+                        value_suffix = '%' if change_type_code == 'pct' else ''
+                        value_label = "% Change" if change_type_code == 'pct' else "Nominal Change"
 
-                        returns_df, period_labels = compute_seasonality(dependent_var, freq_code)
+                        if change_type_code == 'pct' and (dependent_var <= 0).any():
+                            st.warning("⚠️ The dependent variable crosses zero (or goes negative) over this range - "
+                                       "% change is unreliable/explosive here (division by a near-zero base). "
+                                       "Nominal change is safer for spread-type dependent variables.")
+
+                        returns_df, period_labels = compute_seasonality(dependent_var, freq_code, change_type_code)
 
                         if not returns_df.empty:
                             avg_change = returns_df.groupby('Period')['Change'].mean().reindex(range(1, len(period_labels) + 1))
@@ -778,10 +794,11 @@ if st.session_state.get('calculated', False):
                                 x=period_labels, y=avg_change.values,
                                 error_y=dict(type='data', array=std_change.values, visible=True),
                                 marker_color=['#26a69a' if v >= 0 else '#ef5350' for v in avg_change.fillna(0).values],
-                                text=avg_change.round(4), texttemplate='%{text}', textposition='outside'
+                                text=avg_change.round(4), texttemplate='%{text}' + value_suffix, textposition='outside'
                             ))
-                            fig_season_bar.update_layout(title=f"Average {seasonality_freq} Nominal Change (± 1 Std Dev)", template="plotly_dark",
-                                                          height=400, xaxis_title=period_axis_title, yaxis_title="Average Nominal Change")
+                            fig_season_bar.update_layout(title=f"Average {seasonality_freq} {value_label} (± 1 Std Dev)", template="plotly_dark",
+                                                          height=400, xaxis_title=period_axis_title, yaxis_title=f"Average {value_label}")
+                            fig_season_bar.update_yaxes(ticksuffix=value_suffix)
                             st.plotly_chart(fig_season_bar, use_container_width=True)
 
                             pivot = returns_df.pivot_table(index='Year', columns='Period', values='Change', aggfunc='mean')
@@ -792,10 +809,10 @@ if st.session_state.get('calculated', False):
 
                             fig_season_heat = go.Figure(go.Heatmap(
                                 z=pivot_display.values, x=pivot_display.columns, y=pivot_display.index.astype(str),
-                                text=np.round(pivot_display.values, 4), texttemplate="%{text}",
-                                colorscale='RdYlGn', zmid=0, colorbar=dict(title="Nominal Change")
+                                text=np.round(pivot_display.values, 4), texttemplate="%{text}" + value_suffix,
+                                colorscale='RdYlGn', zmid=0, colorbar=dict(title=value_label)
                             ))
-                            fig_season_heat.update_layout(title=f"{seasonality_freq} Nominal Change Heatmap by Year", template="plotly_dark",
+                            fig_season_heat.update_layout(title=f"{seasonality_freq} {value_label} Heatmap by Year", template="plotly_dark",
                                                            height=600, xaxis_title=period_axis_title, yaxis_title="Year", xaxis_side='top')
                             fig_season_heat.update_yaxes(autorange='reversed')
                             st.plotly_chart(fig_season_heat, use_container_width=True)
