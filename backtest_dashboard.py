@@ -98,6 +98,88 @@ def calculate_dependent_variable(data, ticker_weights):
     
     return dependent_var, result_data
 
+@st.cache_data
+def fetch_yahoo_ohlc(tickers, start_date, end_date):
+    """
+    Fetch Open/High/Low/Close (not just Close) for the dependent-variable candlestick chart.
+    Returns {'Open': df, 'High': df, 'Low': df, 'Close': df}, each a date-indexed DataFrame
+    with one column per ticker - same shape/fetch pattern as fetch_yahoo_data.
+    """
+    try:
+        import yfinance as yf
+
+        if isinstance(tickers, str):
+            tickers = [tickers]
+        tickers = list(dict.fromkeys(tickers))
+
+        raw = yf.download(
+            tickers, start=start_date, end=end_date,
+            progress=False, auto_adjust=False, group_by="ticker", threads=True,
+        )
+        if raw.empty:
+            return {}
+
+        result = {}
+        for field in ['Open', 'High', 'Low', 'Close']:
+            data = pd.DataFrame(index=raw.index)
+            if len(tickers) == 1:
+                ticker = tickers[0]
+                data[ticker] = raw[ticker][field] if isinstance(raw.columns, pd.MultiIndex) else raw[field]
+            else:
+                for ticker in tickers:
+                    try:
+                        data[ticker] = raw[ticker][field]
+                    except (KeyError, TypeError):
+                        pass
+            data.index.name = 'date'
+            result[field] = data.dropna(how='all')
+        return result
+
+    except Exception as e:
+        st.error(f"Yahoo Finance API error: {str(e)}")
+        return {}
+
+def calculate_dependent_variable_ohlc(ohlc_data, ticker_weights):
+    """
+    Weighted OHLC for the dependent variable. Open/Close are the same weighted sum used to
+    build the (Close-based) dependent variable, applied to that field. High/Low need care:
+    for a NEGATIVE weight, that leg's contribution to the combination's daily High actually
+    comes from its own Low (multiplying by a negative flips which extreme pushes the sum up),
+    and vice versa - so this isn't just summing each ticker's own High/Low. Still an
+    approximation of the combined path's true intraday extreme (would need intraday data for
+    that), but a correctly-signed one - the same construction index providers use for a
+    synthetic instrument's OHLC.
+    """
+    active_tickers = {k: v for k, v in ticker_weights.items() if k and v != 0}
+    if not active_tickers or not ohlc_data:
+        return pd.DataFrame()
+
+    tickers = list(active_tickers.keys())
+    per_field = {}
+    for field in ['Open', 'High', 'Low', 'Close']:
+        field_data = ohlc_data.get(field, pd.DataFrame())
+        if any(t not in field_data.columns for t in tickers):
+            return pd.DataFrame()
+        per_field[field] = field_data[tickers]
+
+    idx = per_field['Open'].dropna().index
+    for field in ['High', 'Low', 'Close']:
+        idx = idx.intersection(per_field[field].dropna().index)
+    if len(idx) == 0:
+        return pd.DataFrame()
+    open_d, high_d, low_d, close_d = (per_field[f].loc[idx] for f in ['Open', 'High', 'Low', 'Close'])
+
+    weighted_open = sum(w * open_d[t] for t, w in active_tickers.items())
+    weighted_close = sum(w * close_d[t] for t, w in active_tickers.items())
+    weighted_high = sum((w * high_d[t] if w > 0 else w * low_d[t]) for t, w in active_tickers.items())
+    weighted_low = sum((w * low_d[t] if w > 0 else w * high_d[t]) for t, w in active_tickers.items())
+
+    result = pd.DataFrame({'Open': weighted_open, 'High': weighted_high, 'Low': weighted_low, 'Close': weighted_close})
+    # guard against float edge cases so Open/Close always sit within [Low, High]
+    result['High'] = result[['Open', 'High', 'Low', 'Close']].max(axis=1)
+    result['Low'] = result[['Open', 'High', 'Low', 'Close']].min(axis=1)
+    return result.dropna()
+
 def evaluate_indicator_conditions(data, indicators):
     individual_conditions = {}
     rolling_return_columns = {}
@@ -822,8 +904,23 @@ if st.session_state.get('calculated', False):
                         # Time series plot
                         st.subheader("Dependent Variable with Signal Analysis")
                         fig = go.Figure()
-                        fig.add_trace(go.Scatter(x=dependent_var.index, y=dependent_var.values, mode='lines', name='Dependent Variable', line=dict(color='#636EFA', width=1.5)))
-                        
+
+                        with st.spinner("Fetching OHLC data for candlestick..."):
+                            ohlc_data = fetch_yahoo_ohlc(active_tickers, start_date, end_date)
+                        dep_ohlc = calculate_dependent_variable_ohlc(ohlc_data, ticker_weights)
+                        dep_ohlc = dep_ohlc.reindex(dependent_var.index).dropna()
+
+                        if not dep_ohlc.empty:
+                            fig.add_trace(go.Candlestick(
+                                x=dep_ohlc.index, open=dep_ohlc['Open'], high=dep_ohlc['High'],
+                                low=dep_ohlc['Low'], close=dep_ohlc['Close'], name='Dependent Variable',
+                                increasing_line_color='#26a69a', decreasing_line_color='#ef5350'
+                            ))
+                            fig.update_layout(xaxis_rangeslider_visible=False)
+                        else:
+                            st.info("Candlestick unavailable for this configuration (missing OHLC data) - showing as a line instead.")
+                            fig.add_trace(go.Scatter(x=dependent_var.index, y=dependent_var.values, mode='lines', name='Dependent Variable', line=dict(color='#636EFA', width=1.5)))
+
                         if len(cluster_free_dates) > 0:
                             cluster_free_values = dependent_var.loc[cluster_free_dates]
                             fig.add_trace(go.Scatter(x=cluster_free_values.index, y=cluster_free_values.values, mode='markers', name='Cluster-Free Signals', marker=dict(color='#FF6B6B', size=8)))
