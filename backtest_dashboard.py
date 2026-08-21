@@ -303,29 +303,38 @@ def apply_cluster_free_filter(matching_mask, cluster_free_days):
     
     return filtered_mask, removed_signals
 
-def calculate_forward_returns_all_dates(dependent_var, horizons):
-    """Calculate forward returns for ALL dates, not just matching dates"""
+def calculate_forward_returns_all_dates(dependent_var, horizons, change_type='nominal'):
+    """Calculate forward returns for ALL dates, not just matching dates. change_type='pct' uses
+    % return instead of nominal change - meaningless/explosive if the series crosses or sits
+    near zero (same caveat as compute_seasonality). Returns (dict, column_suffix)."""
     forward_returns_all = {}
-    
+    suffix = 'Pct' if change_type == 'pct' else 'Nominal'
+
     for horizon in horizons:
-        forward_returns_all[f'Forward_{horizon}D_Nominal'] = pd.Series(index=dependent_var.index, dtype=float)
-        
+        col = f'Forward_{horizon}D_{suffix}'
+        forward_returns_all[col] = pd.Series(index=dependent_var.index, dtype=float)
+
         for i in range(len(dependent_var)):
-            current_date = dependent_var.index[i]
             forward_idx = i + horizon
-            
+
             if forward_idx < len(dependent_var):
                 initial_value = dependent_var.iloc[i]
                 forward_value = dependent_var.iloc[forward_idx]
-                
-                nominal_change = forward_value - initial_value
-                
-                forward_returns_all[f'Forward_{horizon}D_Nominal'].iloc[i] = nominal_change
-    
-    return forward_returns_all
 
-def calculate_forward_returns_matching_only(dependent_var, matching_dates, horizons, expected_direction):
-    """Calculate forward returns for matching dates only (for dashboard analysis) with Win Rate calculation"""
+                if change_type == 'pct':
+                    change = (forward_value - initial_value) / initial_value * 100 if initial_value != 0 else np.nan
+                else:
+                    change = forward_value - initial_value
+
+                forward_returns_all[col].iloc[i] = change
+
+    return forward_returns_all, suffix
+
+def calculate_forward_returns_matching_only(dependent_var, matching_dates, horizons, expected_direction, change_type='nominal'):
+    """Calculate forward returns for matching dates only (for dashboard analysis) with Win Rate
+    calculation. Works for both the dependent variable and a benchmark series - just pass
+    whichever series and matching dates. change_type='pct' uses % return (same zero-crossing
+    caveat as calculate_forward_returns_all_dates)."""
     forward_returns = {}
     for horizon in horizons:
         horizon_data = []
@@ -333,42 +342,72 @@ def calculate_forward_returns_matching_only(dependent_var, matching_dates, horiz
             try:
                 match_idx = dependent_var.index.get_loc(match_date)
                 forward_idx = match_idx + horizon
-                
+
                 if forward_idx < len(dependent_var):
                     initial_value = dependent_var.iloc[match_idx]
                     forward_value = dependent_var.iloc[forward_idx]
                     nominal_change = forward_value - initial_value
-                    
+
+                    if change_type == 'pct':
+                        change = (nominal_change / initial_value * 100) if initial_value != 0 else np.nan
+                    else:
+                        change = nominal_change
+
                     # Calculate hit based on expected direction
+                    if pd.isna(change):
+                        continue
                     if expected_direction == "Increase":
-                        hit = nominal_change > 0
+                        hit = change > 0
                     else:  # "Decrease"
-                        hit = nominal_change < 0
-                    
+                        hit = change < 0
+
                     horizon_data.append({
                         'Match_Date': match_date,
-                        'Nominal_Change': nominal_change,
+                        'Change': change,
                         'Hit': hit
                     })
             except (KeyError, IndexError):
                 continue
-        
+
         forward_returns[f'{horizon}D'] = pd.DataFrame(horizon_data) if horizon_data else pd.DataFrame()
     return forward_returns
 
-def create_comprehensive_dataframe(price_data, ticker_weights, indicators, dependent_var, matching_mask, individual_conditions, rolling_return_columns, cumulative_sum_columns, forward_returns_all, horizons):
+def calculate_beta(dependent_var, benchmark_var, change_type='nominal'):
+    """Single-figure beta of the dependent variable vs a benchmark over their overlapping date
+    range: slope of dependent-variable daily change regressed on benchmark daily change (via
+    cov/var, equivalent to OLS slope). change_type='nominal' uses daily diffs (safe for
+    spread-type series that cross zero); 'pct' uses daily % returns (the conventional definition
+    for price-like series, but unreliable if either series crosses zero - same caveat as
+    everywhere else % change is used in this dashboard)."""
+    aligned = pd.concat([dependent_var, benchmark_var], axis=1, keys=['Dep', 'Bench']).dropna()
+    if len(aligned) < 3:
+        return None
+    if change_type == 'pct':
+        dep_chg = aligned['Dep'].pct_change() * 100
+        bench_chg = aligned['Bench'].pct_change() * 100
+    else:
+        dep_chg = aligned['Dep'].diff()
+        bench_chg = aligned['Bench'].diff()
+    chg = pd.concat([dep_chg, bench_chg], axis=1, keys=['Dep', 'Bench']).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(chg) < 3 or chg['Bench'].var() == 0:
+        return None
+    return chg['Dep'].cov(chg['Bench']) / chg['Bench'].var()
+
+def create_comprehensive_dataframe(price_data, ticker_weights, indicators, dependent_var, matching_mask, individual_conditions, rolling_return_columns, cumulative_sum_columns, forward_returns_all, horizons, forward_return_suffix='Nominal', benchmark_var=None):
     # Start with the full dependent variable date range
     df = pd.DataFrame(index=dependent_var.index)
-    
+
     # Add individual tickers used in dependent variable
     active_dep_tickers = [t for t, w in ticker_weights.items() if t and w != 0]
     for ticker in active_dep_tickers:
         if ticker in price_data.columns:
             df[ticker] = price_data[ticker].reindex(dependent_var.index)
-    
+
     # Add dependent variable
     df['Dependent_Variable'] = dependent_var
-    
+    if benchmark_var is not None and len(benchmark_var) > 0:
+        df['Benchmark'] = benchmark_var.reindex(dependent_var.index)
+
     # Add indicator tickers (that aren't already included)
     indicator_tickers = [ind['ticker'] for ind in indicators if ind['ticker']]
     for ticker in indicator_tickers:
@@ -394,9 +433,10 @@ def create_comprehensive_dataframe(price_data, ticker_weights, indicators, depen
     aligned_matching = matching_mask.reindex(dependent_var.index, fill_value=False)
     df['Independent_Variable_Condition'] = aligned_matching
     
-    # Add forward return columns for ALL dates (only nominal now)
+    # Add forward return columns for ALL dates
     for horizon in horizons:
-        df[f'Forward_{horizon}D_Nominal'] = forward_returns_all[f'Forward_{horizon}D_Nominal']
+        col = f'Forward_{horizon}D_{forward_return_suffix}'
+        df[col] = forward_returns_all[col]
     
     return df
 
@@ -446,6 +486,24 @@ with st.sidebar.expander("Dependent Variable Components", expanded=True):
         
         if ticker.strip():
             ticker_weights[ticker.strip()] = weight
+
+# Benchmark (optional) - built from its own weighted Yahoo Finance components, same pattern as
+# the dependent variable, so it can be a single index or a custom multi-leg combination too.
+with st.sidebar.expander("Benchmark (Optional)", expanded=False):
+    enable_benchmark = st.checkbox("Enable custom benchmark", value=False, key="enable_benchmark")
+
+    benchmark_weights = {}
+    if enable_benchmark:
+        num_benchmark_components = st.number_input("Number of benchmark components", min_value=1, max_value=10, value=1, key="num_benchmark_components")
+        for i in range(num_benchmark_components):
+            col1, col2 = st.columns([2.5, 1])
+            with col1:
+                b_ticker = st.text_input("Ticker", value="", key=f"bench_ticker_{i}", help="Use Yahoo Finance ticker symbols, e.g. ^GSPC, SPY, ^TNX")
+            with col2:
+                b_weight = st.number_input("Weight", value=1.0, step=0.1, key=f"bench_weight_{i}")
+
+            if b_ticker.strip():
+                benchmark_weights[b_ticker.strip()] = b_weight
 
 # Independent Indicators
 with st.sidebar.expander("Independent Indicator Conditions", expanded=True):
@@ -539,6 +597,10 @@ with st.sidebar.expander("Forward Return Horizons", expanded=True):
         )
         horizons.append(horizon)
 
+    forward_change_type = st.radio("Change Type", ["Nominal", "Percentage"], horizontal=True, key="forward_change_type",
+                                    help="Percentage is unreliable/explosive if the dependent variable (or benchmark) crosses zero - same caveat as the Seasonality toggle.")
+    forward_change_type_code = 'pct' if forward_change_type == "Percentage" else 'nominal'
+
 # Expected Direction for Win Rate Analysis
 with st.sidebar.expander("Win Rate Analysis", expanded=True):
     expected_direction = st.selectbox(
@@ -585,22 +647,31 @@ if st.session_state.get('calculated', False):
                 # Get all tickers
                 active_tickers = [t for t, w in ticker_weights.items() if t and w != 0]
                 indicator_tickers = [ind['ticker'] for ind in indicators if ind['ticker']]
-                all_tickers = list(dict.fromkeys(active_tickers + indicator_tickers))
-                
+                active_benchmark_tickers = [t for t, w in benchmark_weights.items() if t and w != 0] if enable_benchmark else []
+                all_tickers = list(dict.fromkeys(active_tickers + indicator_tickers + active_benchmark_tickers))
+
                 # Fetch data
                 st.info(f"Fetching data for {len(all_tickers)} tickers from {start_date} to {end_date}")
                 price_data = fetch_yahoo_data(all_tickers, start_date, end_date)
-                
+
                 if not price_data.empty:
                     st.success(f"Retrieved {len(price_data)} trading days of data")
-                    
+
                     # Process economic data with forward fill
                     if economic_tickers:
                         st.info(f"Forward filling economic data for: {', '.join(economic_tickers)}")
                         price_data = process_economic_data(price_data, economic_tickers)
-                    
+
                     # Calculate dependent variable
                     dependent_var, result_data = calculate_dependent_variable(price_data, ticker_weights)
+
+                    # Calculate benchmark (optional) - same weighted-combination logic as the
+                    # dependent variable, just against benchmark_weights instead.
+                    benchmark_var = pd.Series(dtype=float)
+                    if enable_benchmark and active_benchmark_tickers:
+                        benchmark_var, _ = calculate_dependent_variable(price_data, benchmark_weights)
+                        if benchmark_var.empty:
+                            st.warning("⚠️ Benchmark enabled but no data could be computed for it - check the benchmark ticker(s).")
 
                     # Flag it when components don't all start on the same date, since the combined
                     # series can only start from whichever component starts LATEST.
@@ -629,18 +700,44 @@ if st.session_state.get('calculated', False):
                         filtered_signal_count = filtered_matching_mask.sum()
                         removed_signal_count = removed_signals.sum()
                         
+                        # Forward-return change type (Nominal/Percentage) - configured in the
+                        # sidebar since it's read here, before any of this is rendered.
+                        if forward_change_type_code == 'pct' and (dependent_var <= 0).any():
+                            st.warning("⚠️ The dependent variable crosses zero (or goes negative) over this range - "
+                                       "% change is unreliable/explosive here (division by a near-zero base) for the "
+                                       "Forward Return Horizons. Nominal change is safer for spread-type dependent variables.")
+                        if forward_change_type_code == 'pct' and not benchmark_var.empty and (benchmark_var <= 0).any():
+                            st.warning("⚠️ The benchmark crosses zero (or goes negative) over this range - % change is "
+                                       "unreliable/explosive for its forward returns and beta too.")
+
+                        change_metric_name = "Nominal" if forward_change_type_code == 'nominal' else "Pct"
+                        change_value_suffix = '' if forward_change_type_code == 'nominal' else '%'
+                        change_display_precision = 3 if forward_change_type_code == 'pct' else 4
+
                         # Calculate forward returns for ALL dates (for CSV)
-                        forward_returns_all = calculate_forward_returns_all_dates(dependent_var, horizons)
-                        
+                        forward_returns_all, forward_return_suffix = calculate_forward_returns_all_dates(dependent_var, horizons, forward_change_type_code)
+
                         # Calculate forward returns for BOTH approaches
-                        forward_returns_cluster_free = calculate_forward_returns_matching_only(dependent_var, cluster_free_dates, horizons, expected_direction)
-                        forward_returns_all_signals = calculate_forward_returns_matching_only(dependent_var, all_matching_dates, horizons, expected_direction)
-                        
+                        forward_returns_cluster_free = calculate_forward_returns_matching_only(dependent_var, cluster_free_dates, horizons, expected_direction, forward_change_type_code)
+                        forward_returns_all_signals = calculate_forward_returns_matching_only(dependent_var, all_matching_dates, horizons, expected_direction, forward_change_type_code)
+
+                        # Same forward-return calculation, applied to the benchmark instead, at
+                        # the same signal dates/horizons - lets the benchmark's forward returns
+                        # be shown alongside the dependent variable's.
+                        benchmark_forward_returns_cluster_free = {}
+                        benchmark_forward_returns_all_signals = {}
+                        beta = None
+                        if not benchmark_var.empty:
+                            benchmark_forward_returns_cluster_free = calculate_forward_returns_matching_only(benchmark_var, cluster_free_dates, horizons, expected_direction, forward_change_type_code)
+                            benchmark_forward_returns_all_signals = calculate_forward_returns_matching_only(benchmark_var, all_matching_dates, horizons, expected_direction, forward_change_type_code)
+                            beta = calculate_beta(dependent_var, benchmark_var, forward_change_type_code)
+
                         # Create comprehensive dataset (using filtered matching mask)
                         comprehensive_df = create_comprehensive_dataframe(
-                            price_data, ticker_weights, indicators, 
-                            dependent_var, filtered_matching_mask, individual_conditions, 
-                            rolling_return_columns, cumulative_sum_columns, forward_returns_all, horizons
+                            price_data, ticker_weights, indicators,
+                            dependent_var, filtered_matching_mask, individual_conditions,
+                            rolling_return_columns, cumulative_sum_columns, forward_returns_all, horizons,
+                            forward_return_suffix, benchmark_var
                         )
                                                 # Enhanced Metrics with Clustering Info
                         col1, col2, col3, col4, col5 = st.columns(5)
@@ -691,49 +788,64 @@ if st.session_state.get('calculated', False):
                         # Show economic data processing info
                         if economic_tickers:
                             st.info(f"📊 Economic data tickers processed with forward fill: {', '.join(economic_tickers)}")
-                        
+
+                        # Benchmark: overall beta (single figure, whole selected date range)
+                        if not benchmark_var.empty:
+                            st.subheader("Benchmark Analysis")
+                            beta_col, info_col = st.columns([1, 3])
+                            with beta_col:
+                                st.metric("Beta vs Benchmark", f"{beta:.3f}" if beta is not None else "N/A")
+                            with info_col:
+                                basis = "daily nominal changes" if forward_change_type_code == 'nominal' else "daily % returns"
+                                st.caption(f"Slope of the dependent variable's {basis} regressed on the benchmark's, over the "
+                                           f"full overlapping date range ({change_metric_name} basis, matching the Change Type "
+                                           f"toggle above). Forward returns for the benchmark are shown alongside the "
+                                           f"dependent variable's below.")
+
                         # Analysis 1: Cluster-Free Forward Return Analysis
                         if forward_returns_cluster_free and any(not df.empty for df in forward_returns_cluster_free.values()):
                             st.subheader("Cluster-Free Forward Return Analysis")
-                            st.markdown(f"**Method:** {cluster_free_days}-day cooldown after each signal | **Expected Direction:** {expected_direction}")
-                            
+                            st.markdown(f"**Method:** {cluster_free_days}-day cooldown after each signal | **Expected Direction:** {expected_direction} | **Change Type:** {forward_change_type}")
+
+                            avg_col, median_col = f'Avg {change_metric_name}', f'Median {change_metric_name}'
+
                             # Summary statistics with Win Rate for Cluster-Free
                             summary_data_cf = []
                             for horizon in horizons:
                                 horizon_key = f'{horizon}D'
                                 if horizon_key in forward_returns_cluster_free and not forward_returns_cluster_free[horizon_key].empty:
                                     df_fwd = forward_returns_cluster_free[horizon_key]
-                                    
+
                                     # Calculate Win Rate and standard deviation
                                     win_rate = df_fwd['Hit'].mean() * 100 if len(df_fwd) > 0 else 0
-                                    std_dev = df_fwd['Nominal_Change'].std()
-                                    
+                                    std_dev = df_fwd['Change'].std()
+
                                     summary_data_cf.append({
                                         'Horizon': f'{horizon}D',
                                         'Sample Size': len(df_fwd),
-                                        'Avg Nominal': df_fwd['Nominal_Change'].mean(),
-                                        'Median Nominal': df_fwd['Nominal_Change'].median(),
+                                        avg_col: df_fwd['Change'].mean(),
+                                        median_col: df_fwd['Change'].median(),
                                         'Std Dev': std_dev,
                                         'Win Rate': win_rate
                                     })
-                            
+
                             if summary_data_cf:
                                 # Display metrics with Win Rate for Cluster-Free
                                 horizon_cols = st.columns(len(summary_data_cf))
                                 for i, row in enumerate(summary_data_cf):
                                     with horizon_cols[i]:
                                         st.metric(f"{row['Horizon']} Sample", f"{int(row['Sample Size']):,}")
-                                        st.metric("Avg Nominal", f"{row['Avg Nominal']:.4f}")
-                                        st.metric("Median Nominal", f"{row['Median Nominal']:.4f}")
-                                        st.metric("Win Rate", f"{row['Win Rate']:.1f}%", 
+                                        st.metric(avg_col, f"{row[avg_col]:.{change_display_precision}f}{change_value_suffix}")
+                                        st.metric(median_col, f"{row[median_col]:.{change_display_precision}f}{change_value_suffix}")
+                                        st.metric("Win Rate", f"{row['Win Rate']:.1f}%",
                                                 help=f"% of times dependent variable moved in expected direction ({expected_direction.lower()})")
-                                
+
                                 # Summary table for Cluster-Free
                                 st.markdown("**Cluster-Free Summary Statistics:**")
                                 summary_df_cf = pd.DataFrame(summary_data_cf)
-                                st.dataframe(summary_df_cf.round({'Avg Nominal': 4, 'Median Nominal': 4, 'Win Rate': 1}), 
+                                st.dataframe(summary_df_cf.round({avg_col: change_display_precision, median_col: change_display_precision, 'Win Rate': 1}),
                                            use_container_width=True, hide_index=True)
-                                
+
                                 # Distribution plots for Cluster-Free
                                 fig_dist_cf = make_subplots(
                                     rows=1, cols=len(summary_data_cf),
@@ -748,70 +860,99 @@ if st.session_state.get('calculated', False):
                                     if horizon_key in forward_returns_cluster_free and not forward_returns_cluster_free[horizon_key].empty:
                                         df_fwd = forward_returns_cluster_free[horizon_key]
                                         color = colors[i % len(colors)]
-                                        
+
                                         # Add histogram
-                                        fig_dist_cf.add_trace(go.Histogram(x=df_fwd['Nominal_Change'], marker_color=color, opacity=0.7, nbinsx=20), row=1, col=col_idx)
-                                        
+                                        fig_dist_cf.add_trace(go.Histogram(x=df_fwd['Change'], marker_color=color, opacity=0.7, nbinsx=20), row=1, col=col_idx)
+
                                         # Calculate statistics
-                                        median_val = df_fwd['Nominal_Change'].median()
-                                        std_val = df_fwd['Nominal_Change'].std()
-                                        
+                                        median_val = df_fwd['Change'].median()
+                                        std_val = df_fwd['Change'].std()
+
                                         # Add median line
                                         fig_dist_cf.add_vline(x=median_val, line_dash="dash", line_color="blue", line_width=2, row=1, col=col_idx)
-                                        
+
                                         # Add +1 std deviation line
                                         fig_dist_cf.add_vline(x=median_val + std_val, line_dash="dot", line_color="red", line_width=2, row=1, col=col_idx)
-                                        
+
                                         # Add -1 std deviation line
                                         fig_dist_cf.add_vline(x=median_val - std_val, line_dash="dot", line_color="red", line_width=2, row=1, col=col_idx)
-                                        
+
                                         col_idx += 1
 
                                 fig_dist_cf.update_layout(title="Cluster-Free Forward Return Distributions", template="plotly_dark", height=400, showlegend=False)
                                 st.plotly_chart(fig_dist_cf, use_container_width=True)
-                        
+
+                            # Benchmark forward returns, same signal dates/horizons
+                            if benchmark_forward_returns_cluster_free and any(not df.empty for df in benchmark_forward_returns_cluster_free.values()):
+                                st.markdown("**Benchmark Forward Returns (Cluster-Free):**")
+                                bench_summary_cf = []
+                                for horizon in horizons:
+                                    horizon_key = f'{horizon}D'
+                                    if horizon_key in benchmark_forward_returns_cluster_free and not benchmark_forward_returns_cluster_free[horizon_key].empty:
+                                        df_b = benchmark_forward_returns_cluster_free[horizon_key]
+                                        bench_summary_cf.append({
+                                            'Horizon': f'{horizon}D', 'Sample Size': len(df_b),
+                                            avg_col: df_b['Change'].mean(), median_col: df_b['Change'].median(),
+                                            'Std Dev': df_b['Change'].std(), 'Win Rate': df_b['Hit'].mean() * 100 if len(df_b) > 0 else 0,
+                                        })
+                                if bench_summary_cf:
+                                    bench_df_cf = pd.DataFrame(bench_summary_cf)
+                                    st.dataframe(bench_df_cf.round({avg_col: change_display_precision, median_col: change_display_precision, 'Win Rate': 1}),
+                                                 use_container_width=True, hide_index=True)
+
+                                    fig_bench_cf = go.Figure()
+                                    dep_avgs = [row[avg_col] for row in summary_data_cf]
+                                    bench_avgs = [row[avg_col] for row in bench_summary_cf]
+                                    fig_bench_cf.add_trace(go.Bar(x=[row['Horizon'] for row in summary_data_cf], y=dep_avgs, name='Dependent Variable', marker_color='#636EFA'))
+                                    fig_bench_cf.add_trace(go.Bar(x=[row['Horizon'] for row in bench_summary_cf], y=bench_avgs, name='Benchmark', marker_color='#FFA500'))
+                                    fig_bench_cf.update_layout(title=f"{avg_col} Forward Return — Dependent vs Benchmark (Cluster-Free)",
+                                                                template="plotly_dark", height=350, barmode='group', yaxis_title=avg_col)
+                                    st.plotly_chart(fig_bench_cf, use_container_width=True)
+
                         # Analysis 2: All Signals Forward Return Analysis
                         if forward_returns_all_signals and any(not df.empty for df in forward_returns_all_signals.values()):
                             st.subheader("All Signals Forward Return Analysis")
-                            st.markdown(f"**Method:** All original signals (no clustering filter) | **Expected Direction:** {expected_direction}")
-                            
+                            st.markdown(f"**Method:** All original signals (no clustering filter) | **Expected Direction:** {expected_direction} | **Change Type:** {forward_change_type}")
+
+                            avg_col, median_col = f'Avg {change_metric_name}', f'Median {change_metric_name}'
+
                             # Summary statistics with Win Rate for All Signals
                             summary_data_all = []
                             for horizon in horizons:
                                 horizon_key = f'{horizon}D'
                                 if horizon_key in forward_returns_all_signals and not forward_returns_all_signals[horizon_key].empty:
                                     df_fwd = forward_returns_all_signals[horizon_key]
-                                    
+
                                     # Calculate Win Rate and standard deviation
                                     win_rate = df_fwd['Hit'].mean() * 100 if len(df_fwd) > 0 else 0
-                                    std_dev = df_fwd['Nominal_Change'].std()
-                                    
+                                    std_dev = df_fwd['Change'].std()
+
                                     summary_data_all.append({
                                         'Horizon': f'{horizon}D',
                                         'Sample Size': len(df_fwd),
-                                        'Avg Nominal': df_fwd['Nominal_Change'].mean(),
-                                        'Median Nominal': df_fwd['Nominal_Change'].median(),
+                                        avg_col: df_fwd['Change'].mean(),
+                                        median_col: df_fwd['Change'].median(),
                                         'Std Dev': std_dev,
                                         'Win Rate': win_rate
                                     })
-                            
+
                             if summary_data_all:
                                 # Display metrics with Win Rate for All Signals
                                 horizon_cols = st.columns(len(summary_data_all))
                                 for i, row in enumerate(summary_data_all):
                                     with horizon_cols[i]:
                                         st.metric(f"{row['Horizon']} Sample", f"{int(row['Sample Size']):,}")
-                                        st.metric("Avg Nominal", f"{row['Avg Nominal']:.4f}")
-                                        st.metric("Median Nominal", f"{row['Median Nominal']:.4f}")
-                                        st.metric("Win Rate", f"{row['Win Rate']:.1f}%", 
+                                        st.metric(avg_col, f"{row[avg_col]:.{change_display_precision}f}{change_value_suffix}")
+                                        st.metric(median_col, f"{row[median_col]:.{change_display_precision}f}{change_value_suffix}")
+                                        st.metric("Win Rate", f"{row['Win Rate']:.1f}%",
                                                 help=f"% of times dependent variable moved in expected direction ({expected_direction.lower()})")
-                                
+
                                 # Summary table for All Signals
                                 st.markdown("**All Signals Summary Statistics:**")
                                 summary_df_all = pd.DataFrame(summary_data_all)
-                                st.dataframe(summary_df_all.round({'Avg Nominal': 4, 'Median Nominal': 4, 'Win Rate': 1}), 
+                                st.dataframe(summary_df_all.round({avg_col: change_display_precision, median_col: change_display_precision, 'Win Rate': 1}),
                                            use_container_width=True, hide_index=True)
-                                
+
                                 # Distribution plots for All Signals
                                 fig_dist_all = make_subplots(
                                     rows=1, cols=len(summary_data_all),
@@ -826,27 +967,54 @@ if st.session_state.get('calculated', False):
                                     if horizon_key in forward_returns_all_signals and not forward_returns_all_signals[horizon_key].empty:
                                         df_fwd = forward_returns_all_signals[horizon_key]
                                         color = colors[i % len(colors)]
-                                        
+
                                         # Add histogram
-                                        fig_dist_all.add_trace(go.Histogram(x=df_fwd['Nominal_Change'], marker_color=color, opacity=0.7, nbinsx=20), row=1, col=col_idx)
-                                        
+                                        fig_dist_all.add_trace(go.Histogram(x=df_fwd['Change'], marker_color=color, opacity=0.7, nbinsx=20), row=1, col=col_idx)
+
                                         # Calculate statistics
-                                        median_val = df_fwd['Nominal_Change'].median()
-                                        std_val = df_fwd['Nominal_Change'].std()
-                                        
+                                        median_val = df_fwd['Change'].median()
+                                        std_val = df_fwd['Change'].std()
+
                                         # Add median line
                                         fig_dist_all.add_vline(x=median_val, line_dash="dash", line_color="blue", line_width=2, row=1, col=col_idx)
-                                        
+
                                         # Add +1 std deviation line
                                         fig_dist_all.add_vline(x=median_val + std_val, line_dash="dot", line_color="red", line_width=2, row=1, col=col_idx)
-                                        
+
                                         # Add -1 std deviation line
                                         fig_dist_all.add_vline(x=median_val - std_val, line_dash="dot", line_color="red", line_width=2, row=1, col=col_idx)
-                                        
+
                                         col_idx += 1
 
                                 fig_dist_all.update_layout(title="All Signals Forward Return Distributions", template="plotly_dark", height=400, showlegend=False)
                                 st.plotly_chart(fig_dist_all, use_container_width=True)
+
+                            # Benchmark forward returns, same signal dates/horizons
+                            if benchmark_forward_returns_all_signals and any(not df.empty for df in benchmark_forward_returns_all_signals.values()):
+                                st.markdown("**Benchmark Forward Returns (All Signals):**")
+                                bench_summary_all = []
+                                for horizon in horizons:
+                                    horizon_key = f'{horizon}D'
+                                    if horizon_key in benchmark_forward_returns_all_signals and not benchmark_forward_returns_all_signals[horizon_key].empty:
+                                        df_b = benchmark_forward_returns_all_signals[horizon_key]
+                                        bench_summary_all.append({
+                                            'Horizon': f'{horizon}D', 'Sample Size': len(df_b),
+                                            avg_col: df_b['Change'].mean(), median_col: df_b['Change'].median(),
+                                            'Std Dev': df_b['Change'].std(), 'Win Rate': df_b['Hit'].mean() * 100 if len(df_b) > 0 else 0,
+                                        })
+                                if bench_summary_all:
+                                    bench_df_all = pd.DataFrame(bench_summary_all)
+                                    st.dataframe(bench_df_all.round({avg_col: change_display_precision, median_col: change_display_precision, 'Win Rate': 1}),
+                                                 use_container_width=True, hide_index=True)
+
+                                    fig_bench_all = go.Figure()
+                                    dep_avgs = [row[avg_col] for row in summary_data_all]
+                                    bench_avgs = [row[avg_col] for row in bench_summary_all]
+                                    fig_bench_all.add_trace(go.Bar(x=[row['Horizon'] for row in summary_data_all], y=dep_avgs, name='Dependent Variable', marker_color='#636EFA'))
+                                    fig_bench_all.add_trace(go.Bar(x=[row['Horizon'] for row in bench_summary_all], y=bench_avgs, name='Benchmark', marker_color='#FFA500'))
+                                    fig_bench_all.update_layout(title=f"{avg_col} Forward Return — Dependent vs Benchmark (All Signals)",
+                                                                 template="plotly_dark", height=350, barmode='group', yaxis_title=avg_col)
+                                    st.plotly_chart(fig_bench_all, use_container_width=True)
 
                         # Seasonality
                         st.subheader("Seasonality")
@@ -1040,7 +1208,8 @@ else:
     - **Create dependent variables** from weighted Yahoo Finance ticker combinations
     - **Set independent conditions** using level, rolling return, or cumulative sum indicators
     - **Apply cluster-free filtering** to prevent signal clustering bias
-    - **Analyze forward returns** with dual analysis approach
+    - **Analyze forward returns** with dual analysis approach, in Nominal or Percentage terms
+    - **Compare against an optional custom benchmark** - overall beta, plus the benchmark's own forward returns alongside the dependent variable's
     - **Download comprehensive datasets** for further analysis
     
     **Data Source: Yahoo Finance**
