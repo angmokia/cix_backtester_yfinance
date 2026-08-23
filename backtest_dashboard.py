@@ -372,26 +372,42 @@ def calculate_forward_returns_matching_only(dependent_var, matching_dates, horiz
         forward_returns[f'{horizon}D'] = pd.DataFrame(horizon_data) if horizon_data else pd.DataFrame()
     return forward_returns
 
-def calculate_beta(dependent_var, benchmark_var, change_type='nominal'):
-    """Single-figure beta of the dependent variable vs a benchmark over their overlapping date
-    range: slope of dependent-variable daily change regressed on benchmark daily change (via
-    cov/var, equivalent to OLS slope). change_type='nominal' uses daily diffs (safe for
-    spread-type series that cross zero); 'pct' uses daily % returns (the conventional definition
-    for price-like series, but unreliable if either series crosses zero - same caveat as
-    everywhere else % change is used in this dashboard)."""
+def _aligned_daily_changes(dependent_var, benchmark_var, change_type='nominal'):
+    """Daily changes of the dependent variable and a benchmark, aligned over their overlapping
+    date range. change_type='nominal' uses daily diffs (safe for spread-type series that cross
+    zero); 'pct' uses daily % returns (the conventional definition for price-like series, but
+    unreliable if either series crosses zero - same caveat as everywhere else % change is used
+    in this dashboard). Shared by calculate_beta and get_beta_regression_data so both use
+    identical alignment logic."""
     aligned = pd.concat([dependent_var, benchmark_var], axis=1, keys=['Dep', 'Bench']).dropna()
     if len(aligned) < 3:
-        return None
+        return pd.DataFrame(columns=['Dep', 'Bench'])
     if change_type == 'pct':
         dep_chg = aligned['Dep'].pct_change() * 100
         bench_chg = aligned['Bench'].pct_change() * 100
     else:
         dep_chg = aligned['Dep'].diff()
         bench_chg = aligned['Bench'].diff()
-    chg = pd.concat([dep_chg, bench_chg], axis=1, keys=['Dep', 'Bench']).replace([np.inf, -np.inf], np.nan).dropna()
+    return pd.concat([dep_chg, bench_chg], axis=1, keys=['Dep', 'Bench']).replace([np.inf, -np.inf], np.nan).dropna()
+
+def calculate_beta(dependent_var, benchmark_var, change_type='nominal'):
+    """Single-figure beta of the dependent variable vs a benchmark: slope of dependent-variable
+    daily change regressed on benchmark daily change (via cov/var, equivalent to OLS slope)."""
+    chg = _aligned_daily_changes(dependent_var, benchmark_var, change_type)
     if len(chg) < 3 or chg['Bench'].var() == 0:
         return None
     return chg['Dep'].cov(chg['Bench']) / chg['Bench'].var()
+
+def get_beta_regression_data(dependent_var, benchmark_var, change_type='nominal'):
+    """Same beta as calculate_beta, plus the aligned scatter data, the regression intercept, and
+    R^2 - everything needed to draw the beta-vs-benchmark scatter + regression line chart."""
+    chg = _aligned_daily_changes(dependent_var, benchmark_var, change_type)
+    if len(chg) < 3 or chg['Bench'].var() == 0:
+        return chg, None, None, None
+    beta, intercept = np.polyfit(chg['Bench'], chg['Dep'], 1)
+    corr = chg['Bench'].corr(chg['Dep'])
+    r_squared = corr ** 2 if pd.notna(corr) else None
+    return chg, beta, intercept, r_squared
 
 def create_comprehensive_dataframe(price_data, ticker_weights, indicators, dependent_var, matching_mask, individual_conditions, rolling_return_columns, cumulative_sum_columns, forward_returns_all, horizons, forward_return_suffix='Nominal', benchmark_var=None):
     # Start with the full dependent variable date range
@@ -726,11 +742,12 @@ if st.session_state.get('calculated', False):
                         # be shown alongside the dependent variable's.
                         benchmark_forward_returns_cluster_free = {}
                         benchmark_forward_returns_all_signals = {}
-                        beta = None
+                        beta, beta_intercept, beta_r_squared = None, None, None
+                        beta_chg = pd.DataFrame()
                         if not benchmark_var.empty:
                             benchmark_forward_returns_cluster_free = calculate_forward_returns_matching_only(benchmark_var, cluster_free_dates, horizons, expected_direction, forward_change_type_code)
                             benchmark_forward_returns_all_signals = calculate_forward_returns_matching_only(benchmark_var, all_matching_dates, horizons, expected_direction, forward_change_type_code)
-                            beta = calculate_beta(dependent_var, benchmark_var, forward_change_type_code)
+                            beta_chg, beta, beta_intercept, beta_r_squared = get_beta_regression_data(dependent_var, benchmark_var, forward_change_type_code)
 
                         # Create comprehensive dataset (using filtered matching mask)
                         comprehensive_df = create_comprehensive_dataframe(
@@ -760,10 +777,10 @@ if st.session_state.get('calculated', False):
                         with col4:
                             if cluster_free_days > 0:
                                 filter_rate = (removed_signal_count / original_signal_count * 100) if original_signal_count > 0 else 0
-                                st.metric("Filtered Out", f"{filter_rate:.1f}%", 
+                                st.metric("Filtered Out", f"{filter_rate:.1f}%",
                                          help="Percentage of original signals removed by clustering filter")
-                            else:
-                                st.metric("Current Value", f"{dependent_var.iloc[-1]:.4f}")
+                            # else: nothing clustering-related to show here when the filter is off -
+                            # col5's "Current Value" already covers the dependent variable's latest reading.
                         with col5:
                             st.metric("Current Value", f"{dependent_var.iloc[-1]:.4f}")
                         
@@ -801,6 +818,30 @@ if st.session_state.get('calculated', False):
                                            f"full overlapping date range ({change_metric_name} basis, matching the Change Type "
                                            f"toggle above). Forward returns for the benchmark are shown alongside the "
                                            f"dependent variable's below.")
+
+                            if not beta_chg.empty and beta is not None:
+                                fig_beta_reg = go.Figure()
+                                fig_beta_reg.add_trace(go.Scatter(
+                                    x=beta_chg['Bench'], y=beta_chg['Dep'], mode='markers', name='Daily Changes',
+                                    marker=dict(color='#636EFA', size=5, opacity=0.5),
+                                    hovertemplate=(f"Benchmark: %{{x:.{change_display_precision}f}}{change_value_suffix}<br>"
+                                                   f"Dependent: %{{y:.{change_display_precision}f}}{change_value_suffix}<extra></extra>"),
+                                ))
+                                x_range = np.linspace(beta_chg['Bench'].min(), beta_chg['Bench'].max(), 50)
+                                y_fit = beta * x_range + beta_intercept
+                                fig_beta_reg.add_trace(go.Scatter(
+                                    x=x_range, y=y_fit, mode='lines', name=f'Fit (β={beta:.3f})',
+                                    line=dict(color='#ef5350', width=2),
+                                ))
+                                r2_text = f", R²={beta_r_squared:.3f}" if beta_r_squared is not None else ""
+                                fig_beta_reg.update_layout(
+                                    title=dict(text=f"Dependent Variable vs Benchmark — Daily {change_metric_name} Changes (β={beta:.3f}{r2_text})",
+                                               x=0.5, xanchor="center"),
+                                    template="plotly_dark", height=450,
+                                    xaxis_title=f"Benchmark Daily {change_metric_name} Change{change_value_suffix}",
+                                    yaxis_title=f"Dependent Variable Daily {change_metric_name} Change{change_value_suffix}",
+                                )
+                                st.plotly_chart(fig_beta_reg, use_container_width=True)
 
                         # Analysis 1: Cluster-Free Forward Return Analysis
                         if forward_returns_cluster_free and any(not df.empty for df in forward_returns_cluster_free.values()):
@@ -861,8 +902,19 @@ if st.session_state.get('calculated', False):
                                         df_fwd = forward_returns_cluster_free[horizon_key]
                                         color = colors[i % len(colors)]
 
-                                        # Add histogram
-                                        fig_dist_cf.add_trace(go.Histogram(x=df_fwd['Change'], marker_color=color, opacity=0.7, nbinsx=20), row=1, col=col_idx)
+                                        # Add histogram - manually binned (rather than go.Histogram's auto-binning) so the
+                                        # hover can show an explicit "X to Y<unit>" range instead of Plotly's default
+                                        # unlabeled "(15 - 20, 4)" tuple, which doesn't say whether that's nominal or %.
+                                        counts, bin_edges = np.histogram(df_fwd['Change'].dropna(), bins=20)
+                                        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+                                        bin_widths = bin_edges[1:] - bin_edges[:-1]
+                                        fig_dist_cf.add_trace(go.Bar(
+                                            x=bin_centers, y=counts, width=bin_widths, marker_color=color, opacity=0.7,
+                                            customdata=np.stack([bin_edges[:-1], bin_edges[1:]], axis=-1),
+                                            hovertemplate=(f"Range: %{{customdata[0]:.{change_display_precision}f}}{change_value_suffix} to "
+                                                           f"%{{customdata[1]:.{change_display_precision}f}}{change_value_suffix}<br>"
+                                                           f"Count: %{{y}}<extra></extra>"),
+                                        ), row=1, col=col_idx)
 
                                         # Calculate statistics
                                         median_val = df_fwd['Change'].median()
@@ -879,7 +931,7 @@ if st.session_state.get('calculated', False):
 
                                         col_idx += 1
 
-                                fig_dist_cf.update_layout(title="Cluster-Free Forward Return Distributions", template="plotly_dark", height=400, showlegend=False)
+                                fig_dist_cf.update_layout(title=dict(text="Cluster-Free Forward Return Distributions", x=0.5, xanchor="center"), template="plotly_dark", height=400, showlegend=False)
                                 st.plotly_chart(fig_dist_cf, use_container_width=True)
 
                             # Benchmark forward returns, same signal dates/horizons
@@ -901,11 +953,13 @@ if st.session_state.get('calculated', False):
                                                  use_container_width=True, hide_index=True)
 
                                     fig_bench_cf = go.Figure()
-                                    dep_avgs = [row[avg_col] for row in summary_data_cf]
-                                    bench_avgs = [row[avg_col] for row in bench_summary_cf]
-                                    fig_bench_cf.add_trace(go.Bar(x=[row['Horizon'] for row in summary_data_cf], y=dep_avgs, name='Dependent Variable', marker_color='#636EFA'))
-                                    fig_bench_cf.add_trace(go.Bar(x=[row['Horizon'] for row in bench_summary_cf], y=bench_avgs, name='Benchmark', marker_color='#FFA500'))
-                                    fig_bench_cf.update_layout(title=f"{avg_col} Forward Return — Dependent vs Benchmark (Cluster-Free)",
+                                    dep_avgs = [round(row[avg_col], change_display_precision) for row in summary_data_cf]
+                                    bench_avgs = [round(row[avg_col], change_display_precision) for row in bench_summary_cf]
+                                    fig_bench_cf.add_trace(go.Bar(x=[row['Horizon'] for row in summary_data_cf], y=dep_avgs, name='Dependent Variable', marker_color='#636EFA',
+                                                                   text=dep_avgs, texttemplate=f'%{{text:.{change_display_precision}f}}{change_value_suffix}'))
+                                    fig_bench_cf.add_trace(go.Bar(x=[row['Horizon'] for row in bench_summary_cf], y=bench_avgs, name='Benchmark', marker_color='#FFA500',
+                                                                   text=bench_avgs, texttemplate=f'%{{text:.{change_display_precision}f}}{change_value_suffix}'))
+                                    fig_bench_cf.update_layout(title=dict(text=f"{avg_col} Forward Return — Dependent vs Benchmark (Cluster-Free)", x=0.5, xanchor="center"),
                                                                 template="plotly_dark", height=350, barmode='group', yaxis_title=avg_col)
                                     st.plotly_chart(fig_bench_cf, use_container_width=True)
 
@@ -968,8 +1022,17 @@ if st.session_state.get('calculated', False):
                                         df_fwd = forward_returns_all_signals[horizon_key]
                                         color = colors[i % len(colors)]
 
-                                        # Add histogram
-                                        fig_dist_all.add_trace(go.Histogram(x=df_fwd['Change'], marker_color=color, opacity=0.7, nbinsx=20), row=1, col=col_idx)
+                                        # Add histogram - manually binned, see Cluster-Free section above for why.
+                                        counts, bin_edges = np.histogram(df_fwd['Change'].dropna(), bins=20)
+                                        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+                                        bin_widths = bin_edges[1:] - bin_edges[:-1]
+                                        fig_dist_all.add_trace(go.Bar(
+                                            x=bin_centers, y=counts, width=bin_widths, marker_color=color, opacity=0.7,
+                                            customdata=np.stack([bin_edges[:-1], bin_edges[1:]], axis=-1),
+                                            hovertemplate=(f"Range: %{{customdata[0]:.{change_display_precision}f}}{change_value_suffix} to "
+                                                           f"%{{customdata[1]:.{change_display_precision}f}}{change_value_suffix}<br>"
+                                                           f"Count: %{{y}}<extra></extra>"),
+                                        ), row=1, col=col_idx)
 
                                         # Calculate statistics
                                         median_val = df_fwd['Change'].median()
@@ -986,7 +1049,7 @@ if st.session_state.get('calculated', False):
 
                                         col_idx += 1
 
-                                fig_dist_all.update_layout(title="All Signals Forward Return Distributions", template="plotly_dark", height=400, showlegend=False)
+                                fig_dist_all.update_layout(title=dict(text="All Signals Forward Return Distributions", x=0.5, xanchor="center"), template="plotly_dark", height=400, showlegend=False)
                                 st.plotly_chart(fig_dist_all, use_container_width=True)
 
                             # Benchmark forward returns, same signal dates/horizons
@@ -1008,11 +1071,13 @@ if st.session_state.get('calculated', False):
                                                  use_container_width=True, hide_index=True)
 
                                     fig_bench_all = go.Figure()
-                                    dep_avgs = [row[avg_col] for row in summary_data_all]
-                                    bench_avgs = [row[avg_col] for row in bench_summary_all]
-                                    fig_bench_all.add_trace(go.Bar(x=[row['Horizon'] for row in summary_data_all], y=dep_avgs, name='Dependent Variable', marker_color='#636EFA'))
-                                    fig_bench_all.add_trace(go.Bar(x=[row['Horizon'] for row in bench_summary_all], y=bench_avgs, name='Benchmark', marker_color='#FFA500'))
-                                    fig_bench_all.update_layout(title=f"{avg_col} Forward Return — Dependent vs Benchmark (All Signals)",
+                                    dep_avgs = [round(row[avg_col], change_display_precision) for row in summary_data_all]
+                                    bench_avgs = [round(row[avg_col], change_display_precision) for row in bench_summary_all]
+                                    fig_bench_all.add_trace(go.Bar(x=[row['Horizon'] for row in summary_data_all], y=dep_avgs, name='Dependent Variable', marker_color='#636EFA',
+                                                                    text=dep_avgs, texttemplate=f'%{{text:.{change_display_precision}f}}{change_value_suffix}'))
+                                    fig_bench_all.add_trace(go.Bar(x=[row['Horizon'] for row in bench_summary_all], y=bench_avgs, name='Benchmark', marker_color='#FFA500',
+                                                                    text=bench_avgs, texttemplate=f'%{{text:.{change_display_precision}f}}{change_value_suffix}'))
+                                    fig_bench_all.update_layout(title=dict(text=f"{avg_col} Forward Return — Dependent vs Benchmark (All Signals)", x=0.5, xanchor="center"),
                                                                  template="plotly_dark", height=350, barmode='group', yaxis_title=avg_col)
                                     st.plotly_chart(fig_bench_all, use_container_width=True)
 
@@ -1046,7 +1111,7 @@ if st.session_state.get('calculated', False):
                                 marker_color=['#26a69a' if v >= 0 else '#ef5350' for v in avg_change.fillna(0).values],
                                 text=avg_change.round(4), texttemplate='%{text}' + value_suffix, textposition='outside'
                             ))
-                            fig_season_bar.update_layout(title=f"Average {seasonality_freq} {value_label} (± 1 Std Dev)", template="plotly_dark",
+                            fig_season_bar.update_layout(title=dict(text=f"Average {seasonality_freq} {value_label} (± 1 Std Dev)", x=0.5, xanchor="center"), template="plotly_dark",
                                                           height=400, xaxis_title=period_axis_title, yaxis_title=f"Average {value_label}")
                             fig_season_bar.update_yaxes(ticksuffix=value_suffix)
                             st.plotly_chart(fig_season_bar, use_container_width=True)
@@ -1062,7 +1127,7 @@ if st.session_state.get('calculated', False):
                                 text=np.round(pivot_display.values, 4), texttemplate="%{text}" + value_suffix,
                                 colorscale='RdYlGn', zmid=0, colorbar=dict(title=value_label)
                             ))
-                            fig_season_heat.update_layout(title=f"{seasonality_freq} {value_label} Heatmap by Year", template="plotly_dark",
+                            fig_season_heat.update_layout(title=dict(text=f"{seasonality_freq} {value_label} Heatmap by Year", x=0.5, xanchor="center"), template="plotly_dark",
                                                            height=600, xaxis_title=period_axis_title, yaxis_title="Year", xaxis_side='top')
                             fig_season_heat.update_yaxes(autorange='reversed')
                             st.plotly_chart(fig_season_heat, use_container_width=True)
@@ -1103,7 +1168,7 @@ if st.session_state.get('calculated', False):
                             removed_values = dependent_var.loc[removed_dates]
                             fig.add_trace(go.Scatter(x=removed_values.index, y=removed_values.values, mode='markers', name='Removed by Clustering', marker=dict(color='#FFA500', size=6, symbol='x')))
                         
-                        fig.update_layout(title="Dependent Variable Time Series with Dual Analysis", template="plotly_dark", height=500)
+                        fig.update_layout(title=dict(text="Dependent Variable Time Series with Dual Analysis", x=0.5, xanchor="center"), template="plotly_dark", height=500)
                         st.plotly_chart(fig, use_container_width=True)
                         
                         # Dependent Variable Breakdown
@@ -1142,7 +1207,7 @@ if st.session_state.get('calculated', False):
                             # For single component, just show a note
                             st.info("Single component - the component line represents the total dependent variable")
 
-                        fig_components.update_layout(title="Weighted Components and Total", template="plotly_dark", height=400, showlegend=True)
+                        fig_components.update_layout(title=dict(text="Weighted Components and Total", x=0.5, xanchor="center"), template="plotly_dark", height=400, showlegend=True)
                         st.plotly_chart(fig_components, use_container_width=True)
                         
                         # Complete Dataset Display
@@ -1212,11 +1277,11 @@ else:
     - **Compare against an optional custom benchmark** - overall beta, plus the benchmark's own forward returns alongside the dependent variable's
     - **Download comprehensive datasets** for further analysis
     
-    **Data Source: Yahoo Finance**
-    - Use Yahoo Finance ticker symbols (e.g. `AAPL`, `^VIX`, `^TNX`, `EURUSD=X`, `CL=F`)
+    **Data Source: YFinance API**
+    - Use YFinance tickers (e.g. `AAPL`, `^VIX`, `^TNX`, `EURUSD=X`, `CL=F`)
     - Daily close prices are pulled via `yfinance`
-    - Economic-release series (CPI, GDP, etc.) aren't available through Yahoo Finance - the
-      "Economic Data" forward-fill option is best used for genuinely gappy market series
+    - ECO series (CPI, GDP, etc.) unavailable through YFinance - the
+      "Economic Data" forward-fill option is best used for gappy market series
     
     **Dual Forward Return Analysis**
     - **Cluster-Free Analysis**: X-day cooldown period after each signal
