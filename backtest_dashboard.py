@@ -372,6 +372,43 @@ def calculate_forward_returns_matching_only(dependent_var, matching_dates, horiz
         forward_returns[f'{horizon}D'] = pd.DataFrame(horizon_data) if horizon_data else pd.DataFrame()
     return forward_returns
 
+def calculate_forward_range_matching_only(dep_ohlc, matching_dates, horizons, change_type='nominal', method='true_range'):
+    """Average day-to-day range over each horizon's forward window (the `horizon` trading days
+    immediately after the signal date) - same signal sample as calculate_forward_returns_matching_only,
+    so it's directly comparable to those return stats. dep_ohlc must already be reindexed to the same
+    index as the dependent variable used to derive matching_dates, so positions line up.
+
+    method='true_range' uses max(High-Low, |High-PrevClose|, |Low-PrevClose|) - the standard ATR
+    building block, which also captures gap risk between sessions (relevant here since the dependent
+    variable is a weighted combination of tickers, not a single spot price - a gap in one leg can
+    show up as a gap in the combination even on a day the combination's own High-Low looks tame).
+    method='simple' uses plain High-Low if that's not a concern for your configuration.
+
+    change_type='pct' expresses each day's range as a % of that day's prior close, same normalisation
+    spirit as the pct forward returns elsewhere."""
+    forward_ranges = {}
+    high, low, close = dep_ohlc['High'], dep_ohlc['Low'], dep_ohlc['Close']
+    prev_close = close.shift(1)
+    if method == 'true_range':
+        daily_range = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    else:
+        daily_range = high - low
+    if change_type == 'pct':
+        daily_range = daily_range / prev_close * 100
+
+    for horizon in horizons:
+        event_avgs = []
+        for match_date in matching_dates:
+            try:
+                match_idx = dep_ohlc.index.get_loc(match_date)
+            except KeyError:
+                continue
+            window = daily_range.iloc[match_idx + 1: match_idx + 1 + horizon]
+            if len(window) == horizon and window.notna().all():
+                event_avgs.append(window.mean())
+        forward_ranges[f'{horizon}D'] = pd.Series(event_avgs, dtype=float)
+    return forward_ranges
+
 def _aligned_daily_changes(dependent_var, benchmark_var, change_type='nominal'):
     """Daily changes of the dependent variable and a benchmark, aligned over their overlapping
     date range. change_type='nominal' uses daily diffs (safe for spread-type series that cross
@@ -737,6 +774,16 @@ if st.session_state.get('calculated', False):
                         forward_returns_cluster_free = calculate_forward_returns_matching_only(dependent_var, cluster_free_dates, horizons, expected_direction, forward_change_type_code)
                         forward_returns_all_signals = calculate_forward_returns_matching_only(dependent_var, all_matching_dates, horizons, expected_direction, forward_change_type_code)
 
+                        # Weighted OHLC dependent variable - needed for the Avg Range stat below,
+                        # and reused later for the candlestick chart (cached, so no duplicate fetch).
+                        with st.spinner("Fetching OHLC data for range calculations..."):
+                            ohlc_data = fetch_yahoo_ohlc(active_tickers, start_date, end_date)
+                        dep_ohlc = calculate_dependent_variable_ohlc(ohlc_data, ticker_weights)
+                        dep_ohlc = dep_ohlc.reindex(dependent_var.index)
+
+                        forward_ranges_cluster_free = calculate_forward_range_matching_only(dep_ohlc, cluster_free_dates, horizons, forward_change_type_code)
+                        forward_ranges_all_signals = calculate_forward_range_matching_only(dep_ohlc, all_matching_dates, horizons, forward_change_type_code)
+
                         # Same forward-return calculation, applied to the benchmark instead, at
                         # the same signal dates/horizons - lets the benchmark's forward returns
                         # be shown alongside the dependent variable's.
@@ -849,6 +896,7 @@ if st.session_state.get('calculated', False):
                             st.markdown(f"**Method:** {cluster_free_days}-day cooldown after each signal | **Expected Direction:** {expected_direction} | **Change Type:** {forward_change_type}")
 
                             avg_col, median_col = f'Avg {change_metric_name}', f'Median {change_metric_name}'
+                            range_col = f'Avg Range ({change_metric_name})'
 
                             # Summary statistics with Win Rate for Cluster-Free
                             summary_data_cf = []
@@ -860,6 +908,7 @@ if st.session_state.get('calculated', False):
                                     # Calculate Win Rate and standard deviation
                                     win_rate = df_fwd['Hit'].mean() * 100 if len(df_fwd) > 0 else 0
                                     std_dev = df_fwd['Change'].std()
+                                    range_series = forward_ranges_cluster_free.get(horizon_key, pd.Series(dtype=float))
 
                                     summary_data_cf.append({
                                         'Horizon': f'{horizon}D',
@@ -867,7 +916,8 @@ if st.session_state.get('calculated', False):
                                         avg_col: df_fwd['Change'].mean(),
                                         median_col: df_fwd['Change'].median(),
                                         'Std Dev': std_dev,
-                                        'Win Rate': win_rate
+                                        'Win Rate': win_rate,
+                                        range_col: range_series.mean() if len(range_series) else np.nan
                                     })
 
                             if summary_data_cf:
@@ -880,11 +930,13 @@ if st.session_state.get('calculated', False):
                                         st.metric(median_col, f"{row[median_col]:.{change_display_precision}f}{change_value_suffix}")
                                         st.metric("Win Rate", f"{row['Win Rate']:.1f}%",
                                                 help=f"% of times dependent variable moved in expected direction ({expected_direction.lower()})")
+                                        st.metric(range_col, f"{row[range_col]:.{change_display_precision}f}{change_value_suffix}" if pd.notna(row[range_col]) else "N/A",
+                                                help="Average True Range (max of High-Low, |High-PrevClose|, |Low-PrevClose|) over the horizon's forward trading days, averaged across matching signals.")
 
                                 # Summary table for Cluster-Free
                                 st.markdown("**Cluster-Free Summary Statistics:**")
                                 summary_df_cf = pd.DataFrame(summary_data_cf)
-                                st.dataframe(summary_df_cf.round({avg_col: change_display_precision, median_col: change_display_precision, 'Win Rate': 1}),
+                                st.dataframe(summary_df_cf.round({avg_col: change_display_precision, median_col: change_display_precision, 'Win Rate': 1, range_col: change_display_precision}),
                                            use_container_width=True, hide_index=True)
 
                                 # Distribution plots for Cluster-Free
@@ -969,6 +1021,7 @@ if st.session_state.get('calculated', False):
                             st.markdown(f"**Method:** All original signals (no clustering filter) | **Expected Direction:** {expected_direction} | **Change Type:** {forward_change_type}")
 
                             avg_col, median_col = f'Avg {change_metric_name}', f'Median {change_metric_name}'
+                            range_col = f'Avg Range ({change_metric_name})'
 
                             # Summary statistics with Win Rate for All Signals
                             summary_data_all = []
@@ -980,6 +1033,7 @@ if st.session_state.get('calculated', False):
                                     # Calculate Win Rate and standard deviation
                                     win_rate = df_fwd['Hit'].mean() * 100 if len(df_fwd) > 0 else 0
                                     std_dev = df_fwd['Change'].std()
+                                    range_series = forward_ranges_all_signals.get(horizon_key, pd.Series(dtype=float))
 
                                     summary_data_all.append({
                                         'Horizon': f'{horizon}D',
@@ -987,7 +1041,8 @@ if st.session_state.get('calculated', False):
                                         avg_col: df_fwd['Change'].mean(),
                                         median_col: df_fwd['Change'].median(),
                                         'Std Dev': std_dev,
-                                        'Win Rate': win_rate
+                                        'Win Rate': win_rate,
+                                        range_col: range_series.mean() if len(range_series) else np.nan
                                     })
 
                             if summary_data_all:
@@ -1000,11 +1055,13 @@ if st.session_state.get('calculated', False):
                                         st.metric(median_col, f"{row[median_col]:.{change_display_precision}f}{change_value_suffix}")
                                         st.metric("Win Rate", f"{row['Win Rate']:.1f}%",
                                                 help=f"% of times dependent variable moved in expected direction ({expected_direction.lower()})")
+                                        st.metric(range_col, f"{row[range_col]:.{change_display_precision}f}{change_value_suffix}" if pd.notna(row[range_col]) else "N/A",
+                                                help="Average True Range (max of High-Low, |High-PrevClose|, |Low-PrevClose|) over the horizon's forward trading days, averaged across matching signals.")
 
                                 # Summary table for All Signals
                                 st.markdown("**All Signals Summary Statistics:**")
                                 summary_df_all = pd.DataFrame(summary_data_all)
-                                st.dataframe(summary_df_all.round({avg_col: change_display_precision, median_col: change_display_precision, 'Win Rate': 1}),
+                                st.dataframe(summary_df_all.round({avg_col: change_display_precision, median_col: change_display_precision, 'Win Rate': 1, range_col: change_display_precision}),
                                            use_container_width=True, hide_index=True)
 
                                 # Distribution plots for All Signals
@@ -1138,15 +1195,14 @@ if st.session_state.get('calculated', False):
                         st.subheader("Dependent Variable with Signal Analysis")
                         fig = go.Figure()
 
-                        with st.spinner("Fetching OHLC data for candlestick..."):
-                            ohlc_data = fetch_yahoo_ohlc(active_tickers, start_date, end_date)
-                        dep_ohlc = calculate_dependent_variable_ohlc(ohlc_data, ticker_weights)
-                        dep_ohlc = dep_ohlc.reindex(dependent_var.index).dropna()
+                        # dep_ohlc was already fetched/computed above (for the Avg Range stat) -
+                        # just drop the NaN rows here for a clean candlestick.
+                        dep_ohlc_chart = dep_ohlc.dropna()
 
-                        if not dep_ohlc.empty:
+                        if not dep_ohlc_chart.empty:
                             fig.add_trace(go.Candlestick(
-                                x=dep_ohlc.index, open=dep_ohlc['Open'], high=dep_ohlc['High'],
-                                low=dep_ohlc['Low'], close=dep_ohlc['Close'], name='Dependent Variable',
+                                x=dep_ohlc_chart.index, open=dep_ohlc_chart['Open'], high=dep_ohlc_chart['High'],
+                                low=dep_ohlc_chart['Low'], close=dep_ohlc_chart['Close'], name='Dependent Variable',
                                 increasing_line_color='#26a69a', decreasing_line_color='#ef5350'
                             ))
                             fig.update_layout(xaxis_rangeslider_visible=False)
