@@ -427,6 +427,19 @@ def _aligned_daily_changes(dependent_var, benchmark_var, change_type='nominal'):
         bench_chg = aligned['Bench'].diff()
     return pd.concat([dep_chg, bench_chg], axis=1, keys=['Dep', 'Bench']).replace([np.inf, -np.inf], np.nan).dropna()
 
+Z_SCORE_WINDOWS = {"1M": 21, "3M": 63, "1Y": 252}  # trading days
+
+def calculate_zscores(dependent_var, windows=Z_SCORE_WINDOWS):
+    """Rolling z-score of the dependent variable against its own trailing history - works the
+    same whether dependent_var is an outright single ticker or a weighted/constructed spread,
+    since it only ever operates on the final computed series."""
+    zscores = pd.DataFrame(index=dependent_var.index)
+    for label, window in windows.items():
+        roll_mean = dependent_var.rolling(window).mean()
+        roll_std = dependent_var.rolling(window).std()
+        zscores[f"{label} Z-Score"] = (dependent_var - roll_mean) / roll_std
+    return zscores
+
 def calculate_beta(dependent_var, benchmark_var, change_type='nominal'):
     """Single-figure beta of the dependent variable vs a benchmark: slope of dependent-variable
     daily change regressed on benchmark daily change (via cov/var, equivalent to OLS slope)."""
@@ -804,18 +817,19 @@ if st.session_state.get('calculated', False):
                             forward_return_suffix, benchmark_var
                         )
                                                 # Enhanced Metrics with Clustering Info
-                        col1, col2, col3, col4, col5 = st.columns(5)
+                        zscores = calculate_zscores(dependent_var)
+                        col1, col2, col3, col4, col5, col6, col7, col8 = st.columns(8)
                         with col1:
                             st.metric("Total Data Points", f"{len(dependent_var):,}")
                         with col2:
                             if cluster_free_days > 0:
-                                st.metric("Original Signals", f"{original_signal_count:,}", 
+                                st.metric("Original Signals", f"{original_signal_count:,}",
                                          help="Signals before cluster-free filter")
                             else:
                                 st.metric("Matching Dates", f"{len(all_matching_dates):,}")
                         with col3:
                             if cluster_free_days > 0:
-                                st.metric("Filtered Signals", f"{filtered_signal_count:,}", 
+                                st.metric("Filtered Signals", f"{filtered_signal_count:,}",
                                          delta=f"-{removed_signal_count}" if removed_signal_count > 0 else None,
                                          help=f"Signals after {cluster_free_days}-day cluster-free filter")
                             else:
@@ -829,7 +843,12 @@ if st.session_state.get('calculated', False):
                             # else: nothing clustering-related to show here when the filter is off -
                             # col5's "Current Value" already covers the dependent variable's latest reading.
                         with col5:
-                            st.metric("Current Value", f"{dependent_var.iloc[-1]:.4f}")
+                            st.metric("Current Value", f"{dependent_var.iloc[-1]:.2f}")
+                        for col, label in zip([col6, col7, col8], ["1M Z-Score", "3M Z-Score", "1Y Z-Score"]):
+                            with col:
+                                latest_z = zscores[label].iloc[-1]
+                                st.metric(label, f"{latest_z:.2f}" if pd.notna(latest_z) else "N/A",
+                                         help=f"({label.split()[0]} lookback) - not enough history yet if N/A")
                         
                         # Show clustering filter information
                         if cluster_free_days > 0:
