@@ -429,6 +429,22 @@ def _aligned_daily_changes(dependent_var, benchmark_var, change_type='nominal'):
 
 Z_SCORE_WINDOWS = {"1M": 21, "3M": 63, "1Y": 252}  # trading days
 
+def expected_value_from_histogram(series, bins=20):
+    """Expected value computed from the empirical probability distribution of the SAME 20-bin
+    histogram used for the distribution plot (bin midpoint x bin probability mass), not the raw
+    sample mean - a coarser but literally 'read off the histogram' figure, per spec. Converges
+    to the sample mean as bins increase; with 20 bins it's a close approximation, not identical."""
+    clean = series.dropna()
+    if clean.empty:
+        return np.nan
+    counts, bin_edges = np.histogram(clean, bins=bins)
+    total = counts.sum()
+    if total == 0:
+        return np.nan
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    probabilities = counts / total
+    return float(np.sum(bin_centers * probabilities))
+
 def calculate_zscores(dependent_var, windows=Z_SCORE_WINDOWS):
     """Rolling z-score of the dependent variable against its own trailing history - works the
     same whether dependent_var is an outright single ticker or a weighted/constructed spread,
@@ -767,12 +783,21 @@ if st.session_state.get('calculated', False):
                         removed_signal_count = removed_signals.sum()
                         
                         # Forward-return change type (Nominal/Percentage) - configured in the
-                        # sidebar since it's read here, before any of this is rendered.
-                        if forward_change_type_code == 'pct' and (dependent_var <= 0).any():
-                            st.warning("⚠️ The dependent variable crosses zero (or goes negative) over this range - "
-                                       "% change is unreliable/explosive here (division by a near-zero base) for the "
-                                       "Forward Return Horizons. Nominal change is safer for spread-type dependent variables.")
-                        if forward_change_type_code == 'pct' and not benchmark_var.empty and (benchmark_var <= 0).any():
+                        # sidebar since it's read here, before any of this is rendered. Checked
+                        # regardless of the toggle (not just when 'pct' is selected) because the
+                        # Expected Value (%) metric below always computes the pct version under
+                        # the hood, even in Nominal mode.
+                        if (dependent_var <= 0).any():
+                            if forward_change_type_code == 'pct':
+                                st.warning("⚠️ The dependent variable crosses zero (or goes negative) over this range - "
+                                           "% change is unreliable/explosive here (division by a near-zero base) for the "
+                                           "Forward Return Horizons. Nominal change is safer for spread-type dependent variables.")
+                            else:
+                                st.warning("⚠️ The dependent variable crosses zero (or goes negative) over this range - "
+                                           "the Expected Value (%) metric below will be unreliable/explosive (division by a "
+                                           "near-zero base) even though Nominal is selected. Trust Expected Value ($) instead "
+                                           "for spread-type dependent variables like this one.")
+                        if not benchmark_var.empty and (benchmark_var <= 0).any() and forward_change_type_code == 'pct':
                             st.warning("⚠️ The benchmark crosses zero (or goes negative) over this range - % change is "
                                        "unreliable/explosive for its forward returns and beta too.")
 
@@ -786,6 +811,14 @@ if st.session_state.get('calculated', False):
                         # Calculate forward returns for BOTH approaches
                         forward_returns_cluster_free = calculate_forward_returns_matching_only(dependent_var, cluster_free_dates, horizons, expected_direction, forward_change_type_code)
                         forward_returns_all_signals = calculate_forward_returns_matching_only(dependent_var, all_matching_dates, horizons, expected_direction, forward_change_type_code)
+
+                        # Also compute the OTHER change type (nominal<->pct) purely so the Expected
+                        # Value metric can show both units side by side, regardless of which one the
+                        # Change Type toggle above is set to - every other stat here only shows one
+                        # unit at a time, but Expected Value was asked to show both always.
+                        other_change_type_code = 'nominal' if forward_change_type_code == 'pct' else 'pct'
+                        forward_returns_cluster_free_other = calculate_forward_returns_matching_only(dependent_var, cluster_free_dates, horizons, expected_direction, other_change_type_code)
+                        forward_returns_all_signals_other = calculate_forward_returns_matching_only(dependent_var, all_matching_dates, horizons, expected_direction, other_change_type_code)
 
                         # Weighted OHLC dependent variable - needed for the Avg Range stat below,
                         # and reused later for the candlestick chart (cached, so no duplicate fetch).
@@ -929,6 +962,15 @@ if st.session_state.get('calculated', False):
                                     std_dev = df_fwd['Change'].std()
                                     range_series = forward_ranges_cluster_free.get(horizon_key, pd.Series(dtype=float))
 
+                                    # Expected Value in both units, off the same 20-bin histogram
+                                    # used for the distribution plot below - regardless of which
+                                    # unit the Change Type toggle above is set to.
+                                    df_fwd_other = forward_returns_cluster_free_other.get(horizon_key, pd.DataFrame())
+                                    ev_primary = expected_value_from_histogram(df_fwd['Change'])
+                                    ev_other = expected_value_from_histogram(df_fwd_other['Change']) if not df_fwd_other.empty else np.nan
+                                    ev_nominal = ev_primary if forward_change_type_code == 'nominal' else ev_other
+                                    ev_pct = ev_primary if forward_change_type_code == 'pct' else ev_other
+
                                     summary_data_cf.append({
                                         'Horizon': f'{horizon}D',
                                         'Sample Size': len(df_fwd),
@@ -936,7 +978,9 @@ if st.session_state.get('calculated', False):
                                         median_col: df_fwd['Change'].median(),
                                         'Std Dev': std_dev,
                                         'Win Rate': win_rate,
-                                        range_col: range_series.mean() if len(range_series) else np.nan
+                                        range_col: range_series.mean() if len(range_series) else np.nan,
+                                        'EV Nominal': ev_nominal,
+                                        'EV Pct': ev_pct,
                                     })
 
                             if summary_data_cf:
@@ -951,6 +995,10 @@ if st.session_state.get('calculated', False):
                                                 help=f"% of times dependent variable moved in expected direction ({expected_direction.lower()})")
                                         st.metric(range_col, f"{row[range_col]:.{change_display_precision}f}{change_value_suffix}" if pd.notna(row[range_col]) else "N/A",
                                                 help="Average True Range (max of High-Low, |High-PrevClose|, |Low-PrevClose|) over the horizon's forward trading days, averaged across matching signals.")
+                                        st.metric("Expected Value ($)", f"{row['EV Nominal']:.4f}" if pd.notna(row['EV Nominal']) else "N/A",
+                                                help="Σ(bin midpoint × probability) from the same 20-bin histogram plotted below, in nominal terms.")
+                                        st.metric("Expected Value (%)", f"{row['EV Pct']:.3f}%" if pd.notna(row['EV Pct']) else "N/A",
+                                                help="Σ(bin midpoint × probability) from the same 20-bin histogram plotted below, as a % return.")
 
                                 # Summary table for Cluster-Free
                                 st.markdown("**Cluster-Free Summary Statistics:**")
@@ -1054,6 +1102,14 @@ if st.session_state.get('calculated', False):
                                     std_dev = df_fwd['Change'].std()
                                     range_series = forward_ranges_all_signals.get(horizon_key, pd.Series(dtype=float))
 
+                                    # Expected Value in both units, off the same 20-bin histogram
+                                    # used for the distribution plot below.
+                                    df_fwd_other = forward_returns_all_signals_other.get(horizon_key, pd.DataFrame())
+                                    ev_primary = expected_value_from_histogram(df_fwd['Change'])
+                                    ev_other = expected_value_from_histogram(df_fwd_other['Change']) if not df_fwd_other.empty else np.nan
+                                    ev_nominal = ev_primary if forward_change_type_code == 'nominal' else ev_other
+                                    ev_pct = ev_primary if forward_change_type_code == 'pct' else ev_other
+
                                     summary_data_all.append({
                                         'Horizon': f'{horizon}D',
                                         'Sample Size': len(df_fwd),
@@ -1061,7 +1117,9 @@ if st.session_state.get('calculated', False):
                                         median_col: df_fwd['Change'].median(),
                                         'Std Dev': std_dev,
                                         'Win Rate': win_rate,
-                                        range_col: range_series.mean() if len(range_series) else np.nan
+                                        range_col: range_series.mean() if len(range_series) else np.nan,
+                                        'EV Nominal': ev_nominal,
+                                        'EV Pct': ev_pct,
                                     })
 
                             if summary_data_all:
@@ -1076,6 +1134,10 @@ if st.session_state.get('calculated', False):
                                                 help=f"% of times dependent variable moved in expected direction ({expected_direction.lower()})")
                                         st.metric(range_col, f"{row[range_col]:.{change_display_precision}f}{change_value_suffix}" if pd.notna(row[range_col]) else "N/A",
                                                 help="Average True Range (max of High-Low, |High-PrevClose|, |Low-PrevClose|) over the horizon's forward trading days, averaged across matching signals.")
+                                        st.metric("Expected Value ($)", f"{row['EV Nominal']:.4f}" if pd.notna(row['EV Nominal']) else "N/A",
+                                                help="Σ(bin midpoint × probability) from the same 20-bin histogram plotted below, in nominal terms.")
+                                        st.metric("Expected Value (%)", f"{row['EV Pct']:.3f}%" if pd.notna(row['EV Pct']) else "N/A",
+                                                help="Σ(bin midpoint × probability) from the same 20-bin histogram plotted below, as a % return.")
 
                                 # Summary table for All Signals
                                 st.markdown("**All Signals Summary Statistics:**")
