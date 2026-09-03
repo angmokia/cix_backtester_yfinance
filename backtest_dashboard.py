@@ -1300,38 +1300,28 @@ with tabs[0]:
                             else:
                                 st.info(f"Not enough history in the selected date range to compute {seasonality_freq.lower()} seasonality.")
 
-                            # Rolling Z-Score Bands
-                            st.subheader("Rolling Z-Score Bands")
+                            # Time series plot
+                            st.subheader("Dependent Variable with Signal Analysis")
                             band_window_max = max(20, len(dependent_var) - 1)
                             band_window_default = min(252, band_window_max)
                             band_window = st.number_input(
-                                "Rolling Window (days)", min_value=10, max_value=band_window_max,
+                                "Rolling Band Window (days)", min_value=10, max_value=band_window_max,
                                 value=band_window_default, step=1, key="band_window",
-                                help="Trailing lookback for the rolling mean/std - same mechanics as the "
-                                     "1M/3M/1Y Z-Score tiles above, but user-adjustable and plotted as a "
-                                     "continuous band over time instead of a single latest reading."
+                                help="Trailing lookback for the rolling ±1σ/±2σ bands drawn behind the chart "
+                                     "below - same mechanics as the 1M/3M/1Y Z-Score tiles above, but "
+                                     "user-adjustable."
                             )
                             bands = calculate_rolling_bands(dependent_var, int(band_window)).dropna(subset=['Mean'])
-                            if not bands.empty:
-                                fig_bands = go.Figure()
-                                fig_bands.add_trace(go.Scatter(x=bands.index, y=bands['Upper2'], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
-                                fig_bands.add_trace(go.Scatter(x=bands.index, y=bands['Lower2'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(76,139,245,0.10)', name='±2σ band', hoverinfo='skip'))
-                                fig_bands.add_trace(go.Scatter(x=bands.index, y=bands['Upper1'], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
-                                fig_bands.add_trace(go.Scatter(x=bands.index, y=bands['Lower1'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(76,139,245,0.20)', name='±1σ band', hoverinfo='skip'))
-                                fig_bands.add_trace(go.Scatter(x=bands.index, y=bands['Mean'], mode='lines', line=dict(color='#f5a24c', width=1.3, dash='dot'), name=f'Rolling Mean ({int(band_window)}D)'))
-                                fig_bands.add_trace(go.Scatter(x=dependent_var.index, y=dependent_var.values, mode='lines', line=dict(color='#e8ecf3', width=1.8), name='Dependent Variable'))
-                                fig_bands.update_layout(
-                                    title=dict(text=f"Dependent Variable + Rolling ±1σ/±2σ Bands ({int(band_window)}D)", x=0.5, xanchor="center"),
-                                    template="plotly_dark", height=460, hovermode='x unified',
-                                    legend=dict(orientation='h', y=-0.18, x=0.5, xanchor='center'),
-                                )
-                                st.plotly_chart(fig_bands, use_container_width=True)
-                            else:
-                                st.info(f"Not enough history in the selected date range for a {int(band_window)}-day rolling window.")
+                            if bands.empty:
+                                st.info(f"Not enough history in the selected date range for a {int(band_window)}-day rolling band window - showing the chart without bands.")
 
-                            # Time series plot
-                            st.subheader("Dependent Variable with Signal Analysis")
                             fig = go.Figure()
+
+                            if not bands.empty:
+                                fig.add_trace(go.Scatter(x=bands.index, y=bands['Upper2'], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
+                                fig.add_trace(go.Scatter(x=bands.index, y=bands['Lower2'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(76,139,245,0.10)', name='±2σ band', hoverinfo='skip'))
+                                fig.add_trace(go.Scatter(x=bands.index, y=bands['Upper1'], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
+                                fig.add_trace(go.Scatter(x=bands.index, y=bands['Lower1'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(76,139,245,0.20)', name='±1σ band', hoverinfo='skip'))
 
                             # dep_ohlc was already fetched/computed above (for the Avg Range stat) -
                             # just drop the NaN rows here for a clean candlestick.
@@ -1362,7 +1352,8 @@ with tabs[0]:
                                 removed_values = dependent_var.loc[removed_dates]
                                 fig.add_trace(go.Scatter(x=removed_values.index, y=removed_values.values, mode='markers', name='Removed by Clustering', marker=dict(color='#FFA500', size=6, symbol='x')))
 
-                            fig.update_layout(title=dict(text="Dependent Variable Time Series with Dual Analysis", x=0.5, xanchor="center"), template="plotly_dark", height=500)
+                            band_title_suffix = f" + Rolling ±1σ/±2σ Bands ({int(band_window)}D)" if not bands.empty else ""
+                            fig.update_layout(title=dict(text=f"Dependent Variable Time Series with Dual Analysis{band_title_suffix}", x=0.5, xanchor="center"), template="plotly_dark", height=500)
                             st.plotly_chart(fig, use_container_width=True)
 
                             # Dependent Variable Breakdown
