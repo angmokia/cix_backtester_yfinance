@@ -409,14 +409,20 @@ def calculate_forward_range_matching_only(dep_ohlc, matching_dates, horizons, ch
         forward_ranges[f'{horizon}D'] = pd.Series(event_avgs, dtype=float)
     return forward_ranges
 
-def _aligned_daily_changes(dependent_var, benchmark_var, change_type='nominal'):
-    """Daily changes of the dependent variable and a benchmark, aligned over their overlapping
-    date range. change_type='nominal' uses daily diffs (safe for spread-type series that cross
-    zero); 'pct' uses daily % returns (the conventional definition for price-like series, but
-    unreliable if either series crosses zero - same caveat as everywhere else % change is used
-    in this dashboard). Shared by calculate_beta and get_beta_regression_data so both use
-    identical alignment logic."""
+def _aligned_daily_changes(dependent_var, benchmark_var, change_type='nominal', freq='D'):
+    """Changes of the dependent variable and a benchmark, aligned over their overlapping date
+    range. freq='D' uses every trading day; 'W'/'M' resample to week-end/month-end levels first
+    (last observation of each period) before differencing, so beta reflects weekly/monthly
+    co-movement instead of daily noise. change_type='nominal' uses diffs (safe for spread-type
+    series that cross zero); 'pct' uses % returns (the conventional definition for price-like
+    series, but unreliable if either series crosses zero - same caveat as everywhere else %
+    change is used in this dashboard). Shared by calculate_beta and get_beta_regression_data so
+    both use identical alignment logic."""
     aligned = pd.concat([dependent_var, benchmark_var], axis=1, keys=['Dep', 'Bench']).dropna()
+    if freq == 'W':
+        aligned = aligned.resample('W').last().dropna()
+    elif freq == 'M':
+        aligned = aligned.resample('ME').last().dropna()
     if len(aligned) < 3:
         return pd.DataFrame(columns=['Dep', 'Bench'])
     if change_type == 'pct':
@@ -456,24 +462,39 @@ def calculate_zscores(dependent_var, windows=Z_SCORE_WINDOWS):
         zscores[f"{label} Z-Score"] = (dependent_var - roll_mean) / roll_std
     return zscores
 
-def calculate_beta(dependent_var, benchmark_var, change_type='nominal'):
+def calculate_beta(dependent_var, benchmark_var, change_type='nominal', freq='D'):
     """Single-figure beta of the dependent variable vs a benchmark: slope of dependent-variable
-    daily change regressed on benchmark daily change (via cov/var, equivalent to OLS slope)."""
-    chg = _aligned_daily_changes(dependent_var, benchmark_var, change_type)
+    change regressed on benchmark change (via cov/var, equivalent to OLS slope), at the chosen
+    sampling frequency (freq='D'/'W'/'M')."""
+    chg = _aligned_daily_changes(dependent_var, benchmark_var, change_type, freq)
     if len(chg) < 3 or chg['Bench'].var() == 0:
         return None
     return chg['Dep'].cov(chg['Bench']) / chg['Bench'].var()
 
-def get_beta_regression_data(dependent_var, benchmark_var, change_type='nominal'):
+def get_beta_regression_data(dependent_var, benchmark_var, change_type='nominal', freq='D'):
     """Same beta as calculate_beta, plus the aligned scatter data, the regression intercept, and
     R^2 - everything needed to draw the beta-vs-benchmark scatter + regression line chart."""
-    chg = _aligned_daily_changes(dependent_var, benchmark_var, change_type)
+    chg = _aligned_daily_changes(dependent_var, benchmark_var, change_type, freq)
     if len(chg) < 3 or chg['Bench'].var() == 0:
         return chg, None, None, None
     beta, intercept = np.polyfit(chg['Bench'], chg['Dep'], 1)
     corr = chg['Bench'].corr(chg['Dep'])
     r_squared = corr ** 2 if pd.notna(corr) else None
     return chg, beta, intercept, r_squared
+
+def calculate_rolling_bands(series, window=252):
+    """Rolling mean ± 1σ/2σ bands around a series - same rolling-window mechanics as
+    calculate_zscores, but keeping the full rolling series (not just the latest point) to power
+    a continuous Bollinger-style band chart over time."""
+    roll_mean = series.rolling(window).mean()
+    roll_std = series.rolling(window).std()
+    return pd.DataFrame({
+        'Mean': roll_mean,
+        'Upper1': roll_mean + roll_std,
+        'Lower1': roll_mean - roll_std,
+        'Upper2': roll_mean + 2 * roll_std,
+        'Lower2': roll_mean - 2 * roll_std,
+    })
 
 def create_comprehensive_dataframe(price_data, ticker_weights, indicators, dependent_var, matching_mask, individual_conditions, rolling_return_columns, cumulative_sum_columns, forward_returns_all, horizons, forward_return_suffix='Nominal', benchmark_var=None):
     # Start with the full dependent variable date range
@@ -838,12 +859,9 @@ with tabs[0]:
                             # be shown alongside the dependent variable's.
                             benchmark_forward_returns_cluster_free = {}
                             benchmark_forward_returns_all_signals = {}
-                            beta, beta_intercept, beta_r_squared = None, None, None
-                            beta_chg = pd.DataFrame()
                             if not benchmark_var.empty:
                                 benchmark_forward_returns_cluster_free = calculate_forward_returns_matching_only(benchmark_var, cluster_free_dates, horizons, expected_direction, forward_change_type_code)
                                 benchmark_forward_returns_all_signals = calculate_forward_returns_matching_only(benchmark_var, all_matching_dates, horizons, expected_direction, forward_change_type_code)
-                                beta_chg, beta, beta_intercept, beta_r_squared = get_beta_regression_data(dependent_var, benchmark_var, forward_change_type_code)
 
                             # Create comprehensive dataset (using filtered matching mask)
                             comprehensive_df = create_comprehensive_dataframe(
@@ -911,11 +929,16 @@ with tabs[0]:
                             # Benchmark: overall beta (single figure, whole selected date range)
                             if not benchmark_var.empty:
                                 st.subheader("Benchmark Analysis")
+                                beta_freq_label = st.radio("Beta Frequency", ["Daily", "Weekly", "Monthly"], horizontal=True, key="beta_freq")
+                                beta_freq_code = {"Daily": "D", "Weekly": "W", "Monthly": "M"}[beta_freq_label]
+
+                                beta_chg, beta, beta_intercept, beta_r_squared = get_beta_regression_data(dependent_var, benchmark_var, forward_change_type_code, beta_freq_code)
+
                                 beta_col, info_col = st.columns([1, 3])
                                 with beta_col:
                                     st.metric("Beta vs Benchmark", f"{beta:.3f}" if beta is not None else "N/A")
                                 with info_col:
-                                    basis = "daily nominal changes" if forward_change_type_code == 'nominal' else "daily % returns"
+                                    basis = f"{beta_freq_label.lower()} nominal changes" if forward_change_type_code == 'nominal' else f"{beta_freq_label.lower()} % returns"
                                     st.caption(f"Slope of the dependent variable's {basis} regressed on the benchmark's, over the "
                                                f"full overlapping date range ({change_metric_name} basis, matching the Change Type "
                                                f"toggle above). Forward returns for the benchmark are shown alongside the "
@@ -924,7 +947,7 @@ with tabs[0]:
                                 if not beta_chg.empty and beta is not None:
                                     fig_beta_reg = go.Figure()
                                     fig_beta_reg.add_trace(go.Scatter(
-                                        x=beta_chg['Bench'], y=beta_chg['Dep'], mode='markers', name='Daily Changes',
+                                        x=beta_chg['Bench'], y=beta_chg['Dep'], mode='markers', name=f'{beta_freq_label} Changes',
                                         marker=dict(color='#636EFA', size=5, opacity=0.5),
                                         hovertemplate=(f"Benchmark: %{{x:.{change_display_precision}f}}{change_value_suffix}<br>"
                                                        f"Dependent: %{{y:.{change_display_precision}f}}{change_value_suffix}<extra></extra>"),
@@ -937,13 +960,15 @@ with tabs[0]:
                                     ))
                                     r2_text = f", R²={beta_r_squared:.3f}" if beta_r_squared is not None else ""
                                     fig_beta_reg.update_layout(
-                                        title=dict(text=f"Dependent Variable vs Benchmark — Daily {change_metric_name} Changes (β={beta:.3f}{r2_text})",
+                                        title=dict(text=f"Dependent Variable vs Benchmark — {beta_freq_label} {change_metric_name} Changes (β={beta:.3f}{r2_text})",
                                                    x=0.5, xanchor="center"),
                                         template="plotly_dark", height=450,
-                                        xaxis_title=f"Benchmark Daily {change_metric_name} Change{change_value_suffix}",
-                                        yaxis_title=f"Dependent Variable Daily {change_metric_name} Change{change_value_suffix}",
+                                        xaxis_title=f"Benchmark {beta_freq_label} {change_metric_name} Change{change_value_suffix}",
+                                        yaxis_title=f"Dependent Variable {beta_freq_label} {change_metric_name} Change{change_value_suffix}",
                                     )
                                     st.plotly_chart(fig_beta_reg, use_container_width=True)
+                                elif beta is None:
+                                    st.info(f"Not enough overlapping {beta_freq_label.lower()} observations in this date range to compute beta.")
 
                             # Analysis 1: Cluster-Free Forward Return Analysis
                             if forward_returns_cluster_free and any(not df.empty for df in forward_returns_cluster_free.values()):
@@ -1274,6 +1299,35 @@ with tabs[0]:
                                 st.plotly_chart(fig_season_heat, use_container_width=True)
                             else:
                                 st.info(f"Not enough history in the selected date range to compute {seasonality_freq.lower()} seasonality.")
+
+                            # Rolling Z-Score Bands
+                            st.subheader("Rolling Z-Score Bands")
+                            band_window_max = max(20, len(dependent_var) - 1)
+                            band_window_default = min(252, band_window_max)
+                            band_window = st.number_input(
+                                "Rolling Window (days)", min_value=10, max_value=band_window_max,
+                                value=band_window_default, step=1, key="band_window",
+                                help="Trailing lookback for the rolling mean/std - same mechanics as the "
+                                     "1M/3M/1Y Z-Score tiles above, but user-adjustable and plotted as a "
+                                     "continuous band over time instead of a single latest reading."
+                            )
+                            bands = calculate_rolling_bands(dependent_var, int(band_window)).dropna(subset=['Mean'])
+                            if not bands.empty:
+                                fig_bands = go.Figure()
+                                fig_bands.add_trace(go.Scatter(x=bands.index, y=bands['Upper2'], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
+                                fig_bands.add_trace(go.Scatter(x=bands.index, y=bands['Lower2'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(76,139,245,0.10)', name='±2σ band', hoverinfo='skip'))
+                                fig_bands.add_trace(go.Scatter(x=bands.index, y=bands['Upper1'], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
+                                fig_bands.add_trace(go.Scatter(x=bands.index, y=bands['Lower1'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(76,139,245,0.20)', name='±1σ band', hoverinfo='skip'))
+                                fig_bands.add_trace(go.Scatter(x=bands.index, y=bands['Mean'], mode='lines', line=dict(color='#f5a24c', width=1.3, dash='dot'), name=f'Rolling Mean ({int(band_window)}D)'))
+                                fig_bands.add_trace(go.Scatter(x=dependent_var.index, y=dependent_var.values, mode='lines', line=dict(color='#e8ecf3', width=1.8), name='Dependent Variable'))
+                                fig_bands.update_layout(
+                                    title=dict(text=f"Dependent Variable + Rolling ±1σ/±2σ Bands ({int(band_window)}D)", x=0.5, xanchor="center"),
+                                    template="plotly_dark", height=460, hovermode='x unified',
+                                    legend=dict(orientation='h', y=-0.18, x=0.5, xanchor='center'),
+                                )
+                                st.plotly_chart(fig_bands, use_container_width=True)
+                            else:
+                                st.info(f"Not enough history in the selected date range for a {int(band_window)}-day rolling window.")
 
                             # Time series plot
                             st.subheader("Dependent Variable with Signal Analysis")
