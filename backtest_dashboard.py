@@ -932,25 +932,24 @@ with tabs[0]:
                                     beta_freq_label = st.radio("Beta Frequency", ["Daily", "Weekly", "Monthly"], horizontal=True, key="beta_freq")
                                     beta_freq_code = {"Daily": "D", "Weekly": "W", "Monthly": "M"}[beta_freq_label]
 
-                                    beta_chg, beta, beta_intercept, beta_r_squared = get_beta_regression_data(dependent_var, benchmark_var, forward_change_type_code, beta_freq_code)
+                                    beta_chg, beta, beta_intercept, beta_r_squared = get_beta_regression_data(dependent_var, benchmark_var, 'pct', beta_freq_code)
 
                                     beta_col, info_col = st.columns([1, 3])
                                     with beta_col:
                                         st.metric("Beta vs Benchmark", f"{beta:.3f}" if beta is not None else "N/A")
                                     with info_col:
-                                        basis = f"{beta_freq_label.lower()} nominal changes" if forward_change_type_code == 'nominal' else f"{beta_freq_label.lower()} % returns"
-                                        st.caption(f"Slope of the dependent variable's {basis} regressed on the benchmark's, over the "
-                                                   f"full overlapping date range ({change_metric_name} basis, matching the Change Type "
-                                                   f"toggle above). Forward returns for the benchmark are shown alongside the "
-                                                   f"dependent variable's below.")
+                                        st.caption(f"Slope of the dependent variable's {beta_freq_label.lower()} % returns regressed on the "
+                                                   f"benchmark's, over the full overlapping date range (always % returns, independent of the "
+                                                   f"Change Type toggle above; unreliable if either series crosses zero). Forward returns "
+                                                   f"for the benchmark are shown alongside the dependent variable's below.")
 
                                     if not beta_chg.empty and beta is not None:
                                         fig_beta_reg = go.Figure()
                                         fig_beta_reg.add_trace(go.Scatter(
                                             x=beta_chg['Bench'], y=beta_chg['Dep'], mode='markers', name=f'{beta_freq_label} Changes',
                                             marker=dict(color='#636EFA', size=5, opacity=0.5),
-                                            hovertemplate=(f"Benchmark: %{{x:.{change_display_precision}f}}{change_value_suffix}<br>"
-                                                           f"Dependent: %{{y:.{change_display_precision}f}}{change_value_suffix}<extra></extra>"),
+                                            hovertemplate=("Benchmark: %{x:.3f}%<br>"
+                                                           "Dependent: %{y:.3f}%<extra></extra>"),
                                         ))
                                         x_range = np.linspace(beta_chg['Bench'].min(), beta_chg['Bench'].max(), 50)
                                         y_fit = beta * x_range + beta_intercept
@@ -960,11 +959,11 @@ with tabs[0]:
                                         ))
                                         r2_text = f", R²={beta_r_squared:.3f}" if beta_r_squared is not None else ""
                                         fig_beta_reg.update_layout(
-                                            title=dict(text=f"Dependent Variable vs Benchmark — {beta_freq_label} {change_metric_name} Changes (β={beta:.3f}{r2_text})",
+                                            title=dict(text=f"Dependent Variable vs Benchmark — {beta_freq_label} % Returns (β={beta:.3f}{r2_text})",
                                                        x=0.5, xanchor="center"),
                                             template="plotly_dark", height=450,
-                                            xaxis_title=f"Benchmark {beta_freq_label} {change_metric_name} Change{change_value_suffix}",
-                                            yaxis_title=f"Dependent Variable {beta_freq_label} {change_metric_name} Change{change_value_suffix}",
+                                            xaxis_title=f"Benchmark {beta_freq_label} % Return",
+                                            yaxis_title=f"Dependent Variable {beta_freq_label} % Return",
                                         )
                                         st.plotly_chart(fig_beta_reg, use_container_width=True)
                                     elif beta is None:
