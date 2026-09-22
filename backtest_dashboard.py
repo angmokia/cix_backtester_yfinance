@@ -1564,13 +1564,16 @@ with tabs[1]:
             return f'background-color: rgba(38,166,154,{alpha:.2f}); color: {"#1f8f6b" if t > 0.35 else "#26a69a"}'
         return f'background-color: rgba(239,83,80,{alpha:.2f}); color: {"#c94f45" if t > 0.35 else "#ef5350"}'
 
-    view_col, group_col = st.columns([1, 2])
+    view_col, horizon_col, group_col = st.columns([1, 1, 1.3])
     with view_col:
         screener_view = st.radio("View", ["Table", "Chart Grid"], horizontal=True, key="screener_view")
+    with horizon_col:
+        screener_horizon = st.radio("Return Horizon", ["1M", "3M", "12M"], horizontal=True, key="screener_horizon")
     with group_col:
         screener_group = st.selectbox("Asset Class", list(SCREENER_UNIVERSE.keys()), key="screener_group")
     universe = SCREENER_UNIVERSE[screener_group]
     ticker_to_name = {v: k for k, v in universe.items()}
+    hz_ret, hz_z = f"Return {screener_horizon}", f"Z {screener_horizon}"
 
     screener_end = datetime.today()
     screener_start = screener_end - pd.DateOffset(years=2)
@@ -1584,7 +1587,7 @@ with tabs[1]:
         metrics_df = compute_screener_metrics(screener_prices)
         metrics_df["Instrument"] = metrics_df["ticker"].map(ticker_to_name)
         metrics_df = metrics_df.drop(columns="ticker")
-        metrics_df["_sort"] = metrics_df["Z 12M"].abs()
+        metrics_df["_sort"] = metrics_df[hz_z].abs()
         metrics_df = metrics_df.sort_values("_sort", ascending=False, na_position="last").drop(columns="_sort")
 
         ret_cols = [f"Return {l}" for l in SCREENER_WINDOWS]
@@ -1592,11 +1595,13 @@ with tabs[1]:
         ordered_cols = ["Instrument", "Price"]
         for l in SCREENER_WINDOWS:
             ordered_cols += [f"Return {l}", f"Z {l}"]
-        metrics_df = metrics_df[ordered_cols]
+        metrics_df = metrics_df[ordered_cols]  # full set (all windows) - kept for CSV export regardless of view/horizon
 
-        st.caption(f"{len(metrics_df)} instruments in {screener_group} · sorted by |12M z-score|, most stretched first")
+        st.caption(f"{len(metrics_df)} instruments in {screener_group} · sorted by |{screener_horizon} z-score|, most stretched first")
 
         if screener_view == "Table":
+            # Shows every window regardless of the Return Horizon toggle - that toggle still
+            # drives sort order (and the Chart Grid's single badge) below.
             fmt = {"Price": "{:,.2f}"}
             fmt.update({c: "{:+.1f}%" for c in ret_cols})
             fmt.update({c: "{:+.2f}" for c in z_cols})
@@ -1607,21 +1612,18 @@ with tabs[1]:
                       .format(fmt, na_rep="n/a"))
             st.markdown(styled.hide(axis="index").to_html(), unsafe_allow_html=True)
         else:
-            # Same sort order as the table (|12M z-score| descending), 3 charts per row.
+            # Same sort order as the table (|selected-horizon z-score| descending), 3 charts per row.
             ordered_tickers = metrics_df["Instrument"].map({v: k for k, v in ticker_to_name.items()}).tolist()
             metrics_by_instrument = metrics_df.set_index("Instrument")
             for row_start in range(0, len(ordered_tickers), 3):
                 cols = st.columns(3)
                 for col, ticker in zip(cols, ordered_tickers[row_start:row_start + 3]):
                     name = ticker_to_name[ticker]
-                    series = screener_prices[ticker].dropna()
+                    series = screener_prices[ticker].dropna().tail(SCREENER_WINDOWS[screener_horizon])
                     with col:
                         m = metrics_by_instrument.loc[name]
-                        ret_1m, ret_12m = m.get("Return 1M"), m.get("Return 12M")
-                        badge = " · ".join(filter(None, [
-                            f"1M {ret_1m:+.1f}%" if pd.notna(ret_1m) else None,
-                            f"12M {ret_12m:+.1f}%" if pd.notna(ret_12m) else None,
-                        ]))
+                        ret_val = m.get(hz_ret)
+                        badge = f"{screener_horizon} {ret_val:+.1f}%" if pd.notna(ret_val) else f"{screener_horizon} n/a"
                         st.caption(f"**{name}**  ·  {m['Price']:,.2f}  ·  {badge}")
                         fig_g = go.Figure()
                         fig_g.add_trace(go.Scatter(x=series.index, y=series.values, mode="lines",
