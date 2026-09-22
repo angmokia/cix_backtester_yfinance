@@ -1488,10 +1488,14 @@ with tabs[1]:
                "tab's configuration.")
 
     SCREENER_UNIVERSE = {
-        "FX": {
-            "USD/THB": "THB=X", "USD/IDR": "IDR=X", "NZD/AUD": "NZDAUD=X", "AUD/USD": "AUDUSD=X",
-            "USD/KRW": "KRW=X", "USD/SGD": "SGD=X", "GBP/USD": "GBPUSD=X", "EUR/USD": "EURUSD=X",
-            "USD/JPY": "JPY=X", "US Dollar Index (DXY)": "DX-Y.NYB",
+        "FX Majors": {
+            "EUR/USD": "EURUSD=X", "GBP/USD": "GBPUSD=X", "USD/JPY": "JPY=X",
+            "AUD/USD": "AUDUSD=X", "NZD/AUD": "NZDAUD=X", "US Dollar Index (DXY)": "DX-Y.NYB",
+        },
+        "FX EM Asia": {
+            "USD/SGD": "SGD=X", "USD/THB": "THB=X", "USD/IDR": "IDR=X", "USD/INR": "INR=X",
+            "USD/PHP": "PHP=X", "USD/MYR": "MYR=X", "USD/TWD": "TWD=X", "USD/CNY": "CNY=X",
+            "USD/KRW": "KRW=X", "USD/VND": "VND=X",
         },
         "Rate Futures": {
             "30Y T-Bond Futures (ZB)": "ZB=F", "10Y T-Note Futures (ZN)": "ZN=F",
@@ -1560,7 +1564,11 @@ with tabs[1]:
             return f'background-color: rgba(38,166,154,{alpha:.2f}); color: {"#1f8f6b" if t > 0.35 else "#26a69a"}'
         return f'background-color: rgba(239,83,80,{alpha:.2f}); color: {"#c94f45" if t > 0.35 else "#ef5350"}'
 
-    screener_group = st.selectbox("Asset Class", list(SCREENER_UNIVERSE.keys()), key="screener_group")
+    view_col, group_col = st.columns([1, 2])
+    with view_col:
+        screener_view = st.radio("View", ["Table", "Chart Grid"], horizontal=True, key="screener_view")
+    with group_col:
+        screener_group = st.selectbox("Asset Class", list(SCREENER_UNIVERSE.keys()), key="screener_group")
     universe = SCREENER_UNIVERSE[screener_group]
     ticker_to_name = {v: k for k, v in universe.items()}
 
@@ -1588,15 +1596,40 @@ with tabs[1]:
 
         st.caption(f"{len(metrics_df)} instruments in {screener_group} · sorted by |12M z-score|, most stretched first")
 
-        fmt = {"Price": "{:,.2f}"}
-        fmt.update({c: "{:+.1f}%" for c in ret_cols})
-        fmt.update({c: "{:+.2f}" for c in z_cols})
+        if screener_view == "Table":
+            fmt = {"Price": "{:,.2f}"}
+            fmt.update({c: "{:+.1f}%" for c in ret_cols})
+            fmt.update({c: "{:+.2f}" for c in z_cols})
 
-        styled = (metrics_df.style
-                  .map(lambda v: _screener_cell_style(v, 60), subset=ret_cols)
-                  .map(lambda v: _screener_cell_style(v, 2.5), subset=z_cols)
-                  .format(fmt, na_rep="n/a"))
-        st.markdown(styled.hide(axis="index").to_html(), unsafe_allow_html=True)
+            styled = (metrics_df.style
+                      .map(lambda v: _screener_cell_style(v, 60), subset=ret_cols)
+                      .map(lambda v: _screener_cell_style(v, 2.5), subset=z_cols)
+                      .format(fmt, na_rep="n/a"))
+            st.markdown(styled.hide(axis="index").to_html(), unsafe_allow_html=True)
+        else:
+            # Same sort order as the table (|12M z-score| descending), 3 charts per row.
+            ordered_tickers = metrics_df["Instrument"].map({v: k for k, v in ticker_to_name.items()}).tolist()
+            metrics_by_instrument = metrics_df.set_index("Instrument")
+            for row_start in range(0, len(ordered_tickers), 3):
+                cols = st.columns(3)
+                for col, ticker in zip(cols, ordered_tickers[row_start:row_start + 3]):
+                    name = ticker_to_name[ticker]
+                    series = screener_prices[ticker].dropna()
+                    with col:
+                        m = metrics_by_instrument.loc[name]
+                        ret_1m, ret_12m = m.get("Return 1M"), m.get("Return 12M")
+                        badge = " · ".join(filter(None, [
+                            f"1M {ret_1m:+.1f}%" if pd.notna(ret_1m) else None,
+                            f"12M {ret_12m:+.1f}%" if pd.notna(ret_12m) else None,
+                        ]))
+                        st.caption(f"**{name}**  ·  {m['Price']:,.2f}  ·  {badge}")
+                        fig_g = go.Figure()
+                        fig_g.add_trace(go.Scatter(x=series.index, y=series.values, mode="lines",
+                                                    line=dict(color="#42a5f5", width=1.5)))
+                        fig_g.update_layout(template="plotly_dark", height=220,
+                                             margin=dict(l=30, r=15, t=10, b=20), showlegend=False)
+                        st.plotly_chart(fig_g, use_container_width=True, key=f"screener_grid_{screener_group}_{ticker}")
+
         csv_buf = metrics_df.to_csv(index=False).encode()
         st.download_button("⬇ CSV", csv_buf, file_name=f"screener_{screener_group.replace(' ', '_')}.csv",
                            mime="text/csv", key=f"dl_screener_{screener_group}")
