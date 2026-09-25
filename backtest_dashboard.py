@@ -1165,6 +1165,65 @@ with tabs[0]:
                                 fig.update_layout(title=dict(text=f"Dependent Variable Time Series with Dual Analysis{band_title_suffix}", x=0.5, xanchor="center"), template="plotly_dark", height=500)
                                 st.plotly_chart(fig, use_container_width=True)
 
+                            # Covariance / Correlation Matrix
+                            with st.expander("Covariance Matrix", expanded=True):
+                                COV_BENCHMARK_TICKERS = {
+                                    "10Y Treasury Yield": "^TNX", "Gold": "GC=F", "SPY": "SPY",
+                                    "Bitcoin": "BTC-USD", "Brent Crude": "BZ=F", "US Dollar Index (DXY)": "DX-Y.NYB",
+                                }
+                                cov_mat_col1, cov_mat_col2 = st.columns([1, 1])
+                                with cov_mat_col1:
+                                    cov_matrix_type = st.radio("Matrix Type", ["Correlation", "Covariance"],
+                                                                horizontal=True, key="cov_matrix_type")
+                                with cov_mat_col2:
+                                    cov_lookback_days = st.number_input("Lookback (trading days)", min_value=5,
+                                                                         max_value=2500, value=30, step=5,
+                                                                         key="cov_lookback_days")
+
+                                st.caption("Benchmarks use % returns (safe - they're always-positive prices); CIX "
+                                           "uses nominal (point) changes instead, same as the Change Type caveat "
+                                           "elsewhere on this page - if it's a spread/constructed series that crosses "
+                                           "zero (like the default ^TNX − ^IRX example), its % change explodes on "
+                                           "days it nears zero. Covariance is annualized (daily covariance × 252 "
+                                           "trading days); correlation is unitless (-1 to +1) so isn't annualized.")
+                                with st.spinner("Fetching benchmark data for covariance matrix…"):
+                                    cov_bench_data = fetch_yahoo_data(list(COV_BENCHMARK_TICKERS.values()), start_date, end_date)
+
+                                cov_df = pd.DataFrame(index=dependent_var.index)
+                                for cov_name, cov_ticker in COV_BENCHMARK_TICKERS.items():
+                                    if cov_ticker in cov_bench_data.columns:
+                                        cov_df[cov_name] = cov_bench_data[cov_ticker].reindex(dependent_var.index)
+                                cov_returns = cov_df.pct_change().replace([np.inf, -np.inf], np.nan) * 100
+                                cov_returns.insert(0, "CIX", dependent_var.diff())
+                                cov_returns = cov_returns.dropna().tail(int(cov_lookback_days))
+
+                                if len(cov_returns) < 3:
+                                    st.info("Not enough overlapping data in this date range/lookback to compute a matrix.")
+                                else:
+                                    if cov_matrix_type == "Covariance":
+                                        cov_matrix = cov_returns.cov() * 252
+                                        cov_fmt, cov_zrange, cov_bar_title = "%{text:.4f}", {}, "Ann. Cov."
+                                    else:
+                                        cov_matrix = cov_returns.corr()
+                                        cov_fmt, cov_zrange, cov_bar_title = "%{text:.2f}", dict(zmin=-1, zmax=1), "Corr."
+
+                                    fig_cov = go.Figure(data=go.Heatmap(
+                                        z=cov_matrix.values, x=cov_matrix.columns, y=cov_matrix.columns,
+                                        colorscale="RdBu", zmid=0, **cov_zrange,
+                                        text=cov_matrix.values, texttemplate=cov_fmt, textfont=dict(size=10),
+                                        hovertemplate="%{y} vs %{x}: %{z:.4f}<extra></extra>",
+                                        colorbar=dict(title=cov_bar_title),
+                                    ))
+                                    fig_cov.update_layout(title=dict(text=f"{cov_matrix_type} Matrix — CIX vs. Benchmarks "
+                                                                          f"(Last {len(cov_returns)} Trading Days)",
+                                                                      x=0.5, xanchor="center"),
+                                                           template="plotly_dark", height=480,
+                                                           yaxis=dict(autorange="reversed"))
+                                    st.plotly_chart(fig_cov, use_container_width=True)
+                                    diag_note = "each series' own annualized variance" if cov_matrix_type == "Covariance" else "always 1.00 (a series vs itself)"
+                                    st.caption(f"{len(cov_returns)} trading days used. Diagonal = {diag_note}; a missing column means "
+                                               f"that ticker returned no data for this date range.")
+
                             # Seasonality
                             with st.expander("Seasonality", expanded=True):
                                 season_col1, season_col2 = st.columns(2)
