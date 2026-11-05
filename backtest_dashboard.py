@@ -496,6 +496,24 @@ def calculate_rolling_bands(series, window=252):
         'Lower2': roll_mean - 2 * roll_std,
     })
 
+BAND_LINES = [('Upper2', '+2σ'), ('Upper1', '+1σ'), ('Lower1', '−1σ'), ('Lower2', '−2σ')]
+
+def detect_band_crosses(series, bands):
+    """Dates where the series closes through one of the rolling band lines, keyed by event label
+    (e.g. 'Up through +2σ'). A cross needs the prior close on the other side of that day's line
+    (using each day's own band value, so a line drifting through a flat series counts too). Bands
+    only use data up to and including the cross day, so there's no lookahead - the signal is
+    known at that day's close, which is where forward returns are measured from."""
+    aligned = bands.reindex(series.index)
+    crosses = {}
+    for col, label in BAND_LINES:
+        diff = series - aligned[col]
+        prev = diff.shift(1)
+        valid = diff.notna() & prev.notna()
+        crosses[f"Up through {label}"] = series.index[valid & (prev <= 0) & (diff > 0)]
+        crosses[f"Down through {label}"] = series.index[valid & (prev >= 0) & (diff < 0)]
+    return crosses
+
 def create_comprehensive_dataframe(price_data, ticker_weights, indicators, dependent_var, matching_mask, individual_conditions, rolling_return_columns, cumulative_sum_columns, forward_returns_all, horizons, forward_return_suffix='Nominal', benchmark_var=None):
     # Start with the full dependent variable date range
     df = pd.DataFrame(index=dependent_var.index)
@@ -1124,6 +1142,23 @@ with tabs[0]:
                                 if bands.empty:
                                     st.info(f"Not enough history in the selected date range for a {int(band_window)}-day rolling band window - showing the chart without bands.")
 
+                                # Band crosses - the same cluster-free cooldown as the main signals is
+                                # applied per event type, since a series hugging a line can otherwise
+                                # chatter back and forth through it and count as many crosses.
+                                band_crosses = {}
+                                if not bands.empty:
+                                    for event, cross_dates in detect_band_crosses(dependent_var, bands).items():
+                                        cross_mask = pd.Series(dependent_var.index.isin(cross_dates), index=dependent_var.index)
+                                        if cluster_free_days > 0:
+                                            cross_mask, _ = apply_cluster_free_filter(cross_mask, cluster_free_days)
+                                        band_crosses[event] = dependent_var.index[cross_mask]
+
+                                cross_marker_events = st.multiselect(
+                                    "Show band crosses on chart", list(band_crosses.keys()),
+                                    default=[e for e in ["Up through +2σ", "Down through −2σ"] if e in band_crosses],
+                                    key="band_cross_markers",
+                                ) if band_crosses else []
+
                                 fig = go.Figure()
 
                                 if not bands.empty:
@@ -1161,9 +1196,84 @@ with tabs[0]:
                                     removed_values = dependent_var.loc[removed_dates]
                                     fig.add_trace(go.Scatter(x=removed_values.index, y=removed_values.values, mode='markers', name='Removed by Clustering', marker=dict(color='#FFA500', size=6, symbol='x')))
 
+                                cross_marker_styles = {
+                                    "+2σ": '#ff9800', "+1σ": '#ffd54f', "−1σ": '#81d4fa', "−2σ": '#29b6f6',
+                                }
+                                for event in cross_marker_events:
+                                    cross_dates = band_crosses[event]
+                                    if len(cross_dates) == 0:
+                                        continue
+                                    is_up = event.startswith("Up")
+                                    fig.add_trace(go.Scatter(
+                                        x=cross_dates, y=dependent_var.loc[cross_dates].values, mode='markers', name=event,
+                                        marker=dict(color=cross_marker_styles[event.split()[-1]], size=10,
+                                                    symbol='triangle-up' if is_up else 'triangle-down',
+                                                    line=dict(color='white', width=1)),
+                                    ))
+
                                 band_title_suffix = f" + Rolling ±1σ/±2σ Bands ({int(band_window)}D)" if not bands.empty else ""
                                 fig.update_layout(title=dict(text=f"Dependent Variable Time Series with Dual Analysis{band_title_suffix}", x=0.5, xanchor="center"), template="plotly_dark", height=500)
                                 st.plotly_chart(fig, use_container_width=True)
+
+                                # Forward returns after each band cross, with the unconditional
+                                # every-day baseline on top so each row reads as an edge vs drift.
+                                if band_crosses:
+                                    st.markdown(f"**Forward Returns After Band Crosses** ({int(band_window)}D rolling bands · "
+                                                f"Change Type: {forward_change_type}"
+                                                f"{f' · {cluster_free_days}-day cooldown per event' if cluster_free_days > 0 else ''})")
+                                    cross_rows = []
+                                    baseline_row = {'Event': 'All days (baseline)', 'Count': len(dependent_var)}
+                                    for horizon in horizons:
+                                        all_fwd = forward_returns_all[f'Forward_{horizon}D_{forward_return_suffix}'].dropna()
+                                        baseline_row[f'{horizon}D Avg'] = all_fwd.mean()
+                                        baseline_row[f'{horizon}D Median'] = all_fwd.median()
+                                        baseline_row[f'{horizon}D % Up'] = (all_fwd > 0).mean() * 100 if len(all_fwd) else np.nan
+                                    cross_rows.append(baseline_row)
+
+                                    for event, cross_dates in band_crosses.items():
+                                        row = {'Event': event, 'Count': len(cross_dates)}
+                                        cross_fwd = calculate_forward_returns_matching_only(dependent_var, cross_dates, horizons, "Increase", forward_change_type_code)
+                                        for horizon in horizons:
+                                            df_fwd = cross_fwd.get(f'{horizon}D', pd.DataFrame())
+                                            has_data = not df_fwd.empty
+                                            row[f'{horizon}D Avg'] = df_fwd['Change'].mean() if has_data else np.nan
+                                            row[f'{horizon}D Median'] = df_fwd['Change'].median() if has_data else np.nan
+                                            row[f'{horizon}D % Up'] = df_fwd['Hit'].mean() * 100 if has_data else np.nan
+                                        cross_rows.append(row)
+
+                                    cross_df = pd.DataFrame(cross_rows).set_index('Event')
+                                    avg_cols = [f'{h}D Avg' for h in horizons] + [f'{h}D Median' for h in horizons]
+                                    up_cols = [f'{h}D % Up' for h in horizons]
+                                    cross_df = cross_df[['Count'] + [c for h in horizons for c in (f'{h}D Avg', f'{h}D Median', f'{h}D % Up')]]
+                                    avg_vals = cross_df[avg_cols].to_numpy(dtype=float)
+                                    avg_cap = np.nanmax(np.abs(avg_vals)) if np.isfinite(avg_vals).any() else 1.0
+
+                                    def _cross_cell_style(val, center, cap):
+                                        # Same green/red rgba shading as the Screener table (no matplotlib dependency).
+                                        if pd.isna(val) or cap == 0:
+                                            return ''
+                                        t = min(abs(val - center) / cap, 1.0)
+                                        rgb = '38,166,154' if val >= center else '239,83,80'
+                                        return f'background-color: rgba({rgb},{0.08 + 0.45 * t:.2f})'
+
+                                    # st.dataframe ignores Styler number formats (NaN shows as "None"), so
+                                    # pre-format to strings and shade from the numeric frame instead.
+                                    cross_css = pd.DataFrame('', index=cross_df.index, columns=cross_df.columns)
+                                    cross_display = cross_df.astype(object)
+                                    for c in avg_cols:
+                                        cross_css[c] = cross_df[c].map(lambda v: _cross_cell_style(v, 0, avg_cap))
+                                        cross_display[c] = cross_df[c].map(lambda v: "–" if pd.isna(v) else f"{v:.{change_display_precision}f}{change_value_suffix}")
+                                    for c in up_cols:
+                                        cross_css[c] = cross_df[c].map(lambda v: _cross_cell_style(v, 50, 30))
+                                        cross_display[c] = cross_df[c].map(lambda v: "–" if pd.isna(v) else f"{v:.1f}%")
+                                    cross_display['Count'] = cross_df['Count'].map(lambda v: f"{int(v):,}")
+                                    st.dataframe(cross_display.style.apply(lambda _: cross_css, axis=None), use_container_width=True)
+                                    st.caption("A cross = the close finishes on the other side of that day's band line versus the prior close "
+                                               "(\"Up through +2σ\" = breakout above the upper 2σ line, \"Down through +2σ\" = falling back "
+                                               "inside from above, etc.). Forward returns run from the cross-day close over the sidebar "
+                                               "horizons; % Up is the share of crosses with a positive forward change regardless of the "
+                                               "Expected Direction setting. Compare each row against the baseline row for edge over drift; "
+                                               "small Counts (especially at ±2σ) mean noisy averages.")
 
                             # Covariance / Correlation Matrix
                             with st.expander("Covariance Matrix", expanded=True):
