@@ -1182,6 +1182,36 @@ with tabs[0]:
                                     st.info("Candlestick unavailable for this configuration (missing OHLC data) - showing as a line instead.")
                                     fig.add_trace(go.Scatter(x=dependent_var.index, y=dependent_var.values, mode='lines', name='Dependent Variable', line=dict(color='#636EFA', width=1.5)))
 
+                                # 200-day SMA and 200-week SMA (on Friday weekly closes, stepped onto the
+                                # daily index). Built from a separate fetch starting ~4.5 years before the
+                                # Start Date, so both lines are already warmed up at the left edge of the
+                                # chart instead of needing 200 days / 200 weeks inside the selected range.
+                                ma_col1, ma_col2 = st.columns(2)
+                                with ma_col1:
+                                    show_200dma = st.checkbox("Show 200-day MA", value=True, key="show_200dma")
+                                with ma_col2:
+                                    show_200wma = st.checkbox("Show 200-week MA", value=True, key="show_200wma")
+                                if show_200dma or show_200wma:
+                                    ma_start = (pd.Timestamp(start_date) - pd.DateOffset(weeks=215)).date()
+                                    ma_prices = fetch_yahoo_data(active_tickers, ma_start, end_date)
+                                    if economic_tickers:
+                                        ma_prices = process_economic_data(ma_prices, economic_tickers)
+                                    ma_series, _ = calculate_dependent_variable(ma_prices, ticker_weights) if not ma_prices.empty else (pd.Series(dtype=float), None)
+                                    chart_start = dependent_var.index[0]
+                                    ma_200d = ma_series.rolling(200).mean().loc[chart_start:].dropna()
+                                    ma_200w = (ma_series.resample('W-FRI').last().dropna().rolling(200).mean()
+                                               .reindex(ma_series.index, method='ffill').loc[chart_start:].dropna())
+                                    if show_200dma:
+                                        if not ma_200d.empty:
+                                            fig.add_trace(go.Scatter(x=ma_200d.index, y=ma_200d.values, mode='lines', name='200D MA', line=dict(color='#FFD54F', width=1.5)))
+                                        else:
+                                            st.caption("200-day MA unavailable - the series doesn't have 200 trading days of history yet.")
+                                    if show_200wma:
+                                        if not ma_200w.empty:
+                                            fig.add_trace(go.Scatter(x=ma_200w.index, y=ma_200w.values, mode='lines', name='200W MA', line=dict(color='#BA68C8', width=1.5, dash='dash')))
+                                        else:
+                                            st.caption("200-week MA unavailable - the series doesn't have ~4 years of weekly history yet.")
+
                                 if len(cluster_free_dates) > 0:
                                     cluster_free_values = dependent_var.loc[cluster_free_dates]
                                     fig.add_trace(go.Scatter(x=cluster_free_values.index, y=cluster_free_values.values, mode='markers', name='Cluster-Free Signals', marker=dict(color='#FF6B6B', size=8)))
