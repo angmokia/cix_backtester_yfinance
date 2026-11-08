@@ -249,6 +249,18 @@ def evaluate_indicator_conditions(data, indicators):
                 condition_name = f"{ticker} {days}D cumsum < {threshold}"
                 column_name = f"{ticker}_{days}D_CumSum_Below_{threshold}".replace('.', '_').replace(' ', '_').replace('-', 'neg')
         
+        elif indicator['type'] == 'vs_ticker':
+            other = indicator['other_ticker']
+            if not other or other not in data.columns:
+                continue
+            op = indicator['op']
+            a, b = data[ticker], data[other]
+            # Days where either side is missing count as "not met" (NaN comparisons are False)
+            condition_mask = {'>': a > b, '≥': a >= b, '≤': a <= b, '<': a < b}[op]
+            condition_name = f"{ticker} {op} {other}"
+            op_word = {'>': 'GT', '≥': 'GE', '≤': 'LE', '<': 'LT'}[op]
+            column_name = f"{ticker}_{op_word}_{other}".replace('.', '_').replace(' ', '_').replace('^', '').replace('-', '_')
+
         # Store results
         condition_results[condition_name] = condition_mask
         individual_conditions[column_name] = condition_mask.fillna(False)
@@ -531,6 +543,7 @@ def create_comprehensive_dataframe(price_data, ticker_weights, indicators, depen
 
     # Add indicator tickers (that aren't already included)
     indicator_tickers = [ind['ticker'] for ind in indicators if ind['ticker']]
+    indicator_tickers += [ind['other_ticker'] for ind in indicators if ind.get('other_ticker')]
     for ticker in indicator_tickers:
         if ticker in price_data.columns and ticker not in df.columns:
             df[ticker] = price_data[ticker].reindex(dependent_var.index)
@@ -593,16 +606,16 @@ with col2:
 
 # Dependent Variable
 with st.sidebar.expander("Dependent Variable Components", expanded=True):
-    num_components = st.number_input("Number of components", min_value=1, max_value=10, value=2)
+    num_components = st.number_input("Number of components", min_value=1, max_value=10, value=1)
     
     ticker_weights = {}
     for i in range(num_components):
         col1, col2 = st.columns([2.5, 1])
         with col1:
-            default_tickers = ["^TNX", "^IRX"]
+            default_tickers = ["SPY"]
             ticker = st.text_input("Ticker", value=default_tickers[i] if i < len(default_tickers) else "", key=f"ticker_{i}", help="Use Yahoo Finance ticker symbols, e.g. AAPL, ^VIX, EURUSD=X, ^TNX")
         with col2:
-            default_weights = [1.0, -1.0]
+            default_weights = [1.0]
             weight = st.number_input("Weight", value=default_weights[i] if i < len(default_weights) else 0.0, step=0.1, key=f"weight_{i}")
         
         if ticker.strip():
@@ -649,9 +662,31 @@ with st.sidebar.expander("Independent Indicator Conditions", expanded=True):
             economic_tickers.append(indicator_ticker.strip())
         
         if indicator_ticker.strip():
-            condition_type = st.selectbox("Condition Type", ["Level", "Rolling Return", "Cumulative Sum"], key=f"ind_type_{i}")
-            
-            if condition_type == "Level":
+            condition_type = st.selectbox("Condition Type", ["Level", "Rolling Return", "Cumulative Sum", "Vs Another Ticker"],
+                                          key=f"ind_type_{i}",
+                                          help="Vs Another Ticker: compares this ticker's level with another ticker's level on the same day, e.g. ^VIX > ^VIX3M")
+
+            if condition_type == "Vs Another Ticker":
+                # Labels are markdown: a bare ">" renders as an empty blockquote, so escape it
+                op = st.radio("Operator", [">", "≥", "≤", "<"], horizontal=True, key=f"ind_vs_op_{i}",
+                              format_func=lambda o: "\\>" if o == ">" else o)
+                other_ticker = st.text_input("Other Ticker", value="", key=f"ind_vs_ticker_{i}", placeholder="e.g., ^VIX3M")
+                other_ticker = other_ticker.strip()
+                if other_ticker:
+                    st.caption(f"Condition: **{indicator_ticker.strip()} {op} {other_ticker}**")
+                    if data_type == "Economic Data":
+                        economic_tickers.append(other_ticker)
+                    indicators.append({
+                        'ticker': indicator_ticker.strip(),
+                        'type': 'vs_ticker',
+                        'other_ticker': other_ticker,
+                        'op': op,
+                        'data_type': data_type
+                    })
+                else:
+                    st.caption("Enter the ticker to compare against.")
+
+            elif condition_type == "Level":
                 col1, col2 = st.columns(2)
                 with col1:
                     threshold = st.number_input("Threshold", value=18.0, key=f"ind_threshold_{i}")
@@ -771,6 +806,7 @@ with tabs[0]:
                     # Get all tickers
                     active_tickers = [t for t, w in ticker_weights.items() if t and w != 0]
                     indicator_tickers = [ind['ticker'] for ind in indicators if ind['ticker']]
+                    indicator_tickers += [ind['other_ticker'] for ind in indicators if ind.get('other_ticker')]
                     active_benchmark_tickers = [t for t, w in benchmark_weights.items() if t and w != 0] if enable_benchmark else []
                     all_tickers = list(dict.fromkeys(active_tickers + indicator_tickers + active_benchmark_tickers))
 
@@ -1323,7 +1359,7 @@ with tabs[0]:
                                 st.caption("Benchmarks use % returns (safe - they're always-positive prices); CIX "
                                            "uses nominal (point) changes instead, same as the Change Type caveat "
                                            "elsewhere on this page - if it's a spread/constructed series that crosses "
-                                           "zero (like the default ^TNX − ^IRX example), its % change explodes on "
+                                           "zero (like a ^TNX − ^IRX spread), its % change explodes on "
                                            "days it nears zero. Covariance is annualized (daily covariance × 252 "
                                            "trading days); correlation is unitless (-1 to +1) so isn't annualized.")
                                 with st.spinner("Fetching benchmark data for covariance matrix…"):
@@ -1654,7 +1690,7 @@ with tabs[0]:
 
         This tool allows you to:
         - **Create dependent variables** from weighted Yahoo Finance ticker combinations
-        - **Set independent conditions** using level, rolling return, or cumulative sum indicators
+        - **Set independent conditions** using level, rolling return, cumulative sum, or ticker-vs-ticker (>, ≥, ≤, <) indicators
         - **Apply cluster-free filtering** to prevent signal clustering bias
         - **Analyze forward returns** with dual analysis approach, in Nominal or Percentage terms
         - **Compare against an optional custom benchmark** - overall beta, plus the benchmark's own forward returns alongside the dependent variable's
