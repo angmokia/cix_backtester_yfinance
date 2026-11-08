@@ -1208,10 +1208,23 @@ with tabs[0]:
                                 dep_ohlc_chart = dep_ohlc.dropna()
 
                                 if not dep_ohlc_chart.empty:
+                                    # Day's change vs the previous close, shown under O/H/L/C on hover.
+                                    # % uses |prev close| so the sign still follows direction when a
+                                    # weighted spread is negative; it's flagged n/a near zero, where % blows up.
+                                    prev_close = dep_ohlc_chart['Close'].shift()
+                                    day_chg = dep_ohlc_chart['Close'] - prev_close
+                                    day_pct = day_chg / prev_close.abs() * 100
+                                    tiny = prev_close.abs() < 1e-9
+                                    candle_hover = [
+                                        "Day: n/a" if pd.isna(c) else
+                                        (f"Day: {c:+,.2f} (% n/a)" if t else f"Day: {p:+.2f}% ({c:+,.2f})")
+                                        for c, p, t in zip(day_chg, day_pct, tiny)
+                                    ]
                                     fig.add_trace(go.Candlestick(
                                         x=dep_ohlc_chart.index, open=dep_ohlc_chart['Open'], high=dep_ohlc_chart['High'],
                                         low=dep_ohlc_chart['Low'], close=dep_ohlc_chart['Close'], name='Dependent Variable',
-                                        increasing_line_color='#26a69a', decreasing_line_color='#ef5350'
+                                        increasing_line_color='#26a69a', decreasing_line_color='#ef5350',
+                                        text=candle_hover, hoverinfo='x+y+text'
                                     ))
                                     fig.update_layout(xaxis_rangeslider_visible=False)
                                 else:
