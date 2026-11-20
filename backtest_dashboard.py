@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import cix_gex
 import plotly.io as pio
 from datetime import datetime
 import warnings
@@ -1195,7 +1196,41 @@ with tabs[0]:
                                     key="band_cross_markers",
                                 ) if band_crosses else []
 
-                                fig = go.Figure()
+                                # --- GEX side panel (single-ticker CIX only): today's option positioning by
+                                # strike, drawn on the same price axis to the right of the time series ---
+                                gex_col1, gex_col2, gex_col3, gex_col4 = st.columns([1.2, 1.3, 1.1, 0.9])
+                                with gex_col1:
+                                    show_gex = st.checkbox("Show GEX profile (options, today)", value=True, key="show_gex",
+                                                           help="Gamma exposure by strike from today's open interest (yfinance chain). Single-ticker CIX only.")
+                                with gex_col2:
+                                    gex_mode = st.radio("Profile", ["Net dealer GEX", "Call / Put OI"], horizontal=True, key="gex_mode",
+                                                        label_visibility="collapsed")
+                                with gex_col3:
+                                    gex_days = st.selectbox("Expiries within", [7, 21, 45, 90], index=1, key="gex_days",
+                                                            format_func=lambda d: f"{d} days")
+                                with gex_col4:
+                                    gex_zoom = st.checkbox("Zoom to current price", value=True, key="gex_zoom",
+                                                           help="Frame the last 3 months of price together with the option strikes. Double-click the chart to zoom back out.")
+                                gex = None
+                                if show_gex:
+                                    gex_tickers = [t for t, w in ticker_weights.items() if t and w != 0]
+                                    if len(gex_tickers) != 1:
+                                        st.caption("GEX profile needs a single-ticker dependent variable - hidden for multi-leg CIXs.")
+                                    else:
+                                        gex_ticker, gex_w = gex_tickers[0], ticker_weights[gex_tickers[0]]
+                                        with st.spinner(f"Loading {gex_ticker} option chain..."):
+                                            gex = cix_gex.gex_profile(gex_ticker, max_days=gex_days)
+                                        if "error" in gex:
+                                            st.caption(f"GEX profile unavailable: {gex['error']}"); gex = None
+                                        else:
+                                            # strikes are in the ticker's price units; a weighted single leg scales them
+                                            # (an index typed as ^GSPC maps onto ^SPX strikes, which share its level)
+                                            gex["scale"] = gex_w
+                                if gex is not None:
+                                    fig = make_subplots(rows=1, cols=2, shared_yaxes=True, column_widths=[0.82, 0.18],
+                                                        horizontal_spacing=0.008)
+                                else:
+                                    fig = go.Figure()
 
                                 if not bands.empty:
                                     fig.add_trace(go.Scatter(x=bands.index, y=bands['Upper2'], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
@@ -1290,8 +1325,63 @@ with tabs[0]:
                                                     line=dict(color='white', width=1)),
                                     ))
 
+                                if gex is not None:
+                                    prof, sc = gex["profile"].copy(), gex["scale"]
+                                    prof["y"] = prof.strike * sc
+                                    # keep only strikes inside the price range on screen, so the bars don't stretch the axis
+                                    lo = min(dependent_var.min(), gex["spot"] * sc) * 0.98
+                                    hi = max(dependent_var.max(), gex["spot"] * sc) * 1.02
+                                    prof = prof[(prof.y >= lo) & (prof.y <= hi)]
+                                    bar_w = gex["step"] * abs(sc) * 0.7
+                                    # $bn for index-sized books, $m for single names
+                                    unit, mult = ("bn", 1) if prof.gex_bn.abs().max() >= 0.5 else ("m", 1e3)
+                                    prof["gex_u"] = prof.gex_bn * mult
+                                    if gex_mode == "Net dealer GEX":
+                                        pos, neg = prof.gex_u.clip(lower=0), prof.gex_u.clip(upper=0)
+                                        fig.add_trace(go.Bar(x=pos, y=prof.y, orientation="h", width=bar_w, marker_color="#3ee6a8",
+                                                             name="Dealer long gamma", customdata=prof.strike,
+                                                             hovertemplate="Strike %{customdata:,.2f}<br>GEX %{x:+.2f}" + unit + " per 1%<extra></extra>"), row=1, col=2)
+                                        fig.add_trace(go.Bar(x=neg, y=prof.y, orientation="h", width=bar_w, marker_color="#ff5c8a",
+                                                             name="Dealer short gamma", customdata=prof.strike,
+                                                             hovertemplate="Strike %{customdata:,.2f}<br>GEX %{x:+.2f}" + unit + " per 1%<extra></extra>"), row=1, col=2)
+                                        x_title = f"GEX ${unit} per 1%"
+                                    else:
+                                        fig.add_trace(go.Bar(x=prof.call_oi / 1e3, y=prof.y, orientation="h", width=bar_w, marker_color="#3ee6a8",
+                                                             name="Call OI", customdata=prof.strike,
+                                                             hovertemplate="Strike %{customdata:,.2f}<br>Call OI %{x:,.1f}k<extra></extra>"), row=1, col=2)
+                                        fig.add_trace(go.Bar(x=-prof.put_oi / 1e3, y=prof.y, orientation="h", width=bar_w, marker_color="#ff5c8a",
+                                                             name="Put OI", customdata=np.c_[prof.strike, prof.put_oi / 1e3],
+                                                             hovertemplate="Strike %{customdata[0]:,.2f}<br>Put OI %{customdata[1]:,.1f}k<extra></extra>"), row=1, col=2)
+                                        x_title = "OI (k): puts ← | → calls"
+                                    fig.update_layout(barmode="relative")
+                                    fig.update_xaxes(title_text=x_title, zeroline=True, zerolinecolor="#888", row=1, col=2,
+                                                     showgrid=False, tickfont=dict(size=9))
+                                    # spot + gamma-flip lines run across both panels
+                                    for lvl, colr, lab in ((gex["spot"] * sc, "#ffffff", f"spot {gex['spot']:,.2f}"),
+                                                           (gex["flip"] * sc, "#ffd166", f"γ-flip {gex['flip']:,.2f}")):
+                                        if np.isfinite(lvl) and lo <= lvl <= hi:
+                                            fig.add_shape(type="line", xref="paper", x0=0, x1=1, yref="y", y0=lvl, y1=lvl,
+                                                          line=dict(color=colr, width=1, dash="dot"))
+                                            fig.add_annotation(xref="paper", x=1, yref="y", y=lvl, text=lab, showarrow=False,
+                                                               xanchor="right", yanchor="bottom", font=dict(size=10, color=colr))
+                                    if gex_zoom:
+                                        # frame the last 3 months of price together with the strikes near spot
+                                        recent = dependent_var.loc[dependent_var.index[-1] - pd.DateOffset(months=3):]
+                                        zlo = min(recent.min(), gex["spot"] * sc * 0.85)
+                                        zhi = max(recent.max(), gex["spot"] * sc * 1.15)
+                                        pad = (zhi - zlo) * 0.03
+                                        fig.update_yaxes(range=[zlo - pad, zhi + pad])
+                                        fig.update_xaxes(range=[dependent_var.index[-1] - pd.DateOffset(months=3),
+                                                                dependent_var.index[-1] + pd.Timedelta(days=5)], row=1, col=1)
+                                    fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)),
+                                                      margin=dict(t=110))
+                                    regime = "long gamma (dampening)" if gex["total_bn"] > 0 else "short gamma (amplifying)"
+                                    st.caption(f"GEX profile: {gex['root']} options, {len(gex['expiries'])} expiries to {gex['expiries'][-1]}, "
+                                               f"OI as of {str(gex['asof'])[:16]} ET ({gex['source']}). Net {gex['total_bn'] * (1e3 if abs(gex['total_bn']) < 0.5 else 1):+.2f}{'m' if abs(gex['total_bn']) < 0.5 else 'bn'} per 1% → dealers {regime}. "
+                                               "Assumes dealers long calls / short puts; a snapshot of today, not historical.")
+
                                 band_title_suffix = f" + Rolling ±1σ/±2σ Bands ({int(band_window)}D)" if not bands.empty else ""
-                                fig.update_layout(title=dict(text=f"Dependent Variable Time Series with Dual Analysis{band_title_suffix}", x=0.5, xanchor="center"), template="plotly_dark", height=500)
+                                fig.update_layout(title=dict(text=f"Dependent Variable Time Series with Dual Analysis{band_title_suffix}", x=0.5, xanchor="center"), template="plotly_dark", height=500 if gex is None else 600)
                                 st.plotly_chart(fig, use_container_width=True)
 
                                 # Forward returns after each band cross, with the unconditional
