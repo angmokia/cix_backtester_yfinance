@@ -4,6 +4,7 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import cix_gex
+import regimes
 import plotly.io as pio
 from datetime import datetime
 import warnings
@@ -794,7 +795,8 @@ calculate_button = st.sidebar.button("Calculate & Plot", type="primary", use_con
 if calculate_button:
     st.session_state['calculated'] = True
 
-tabs = st.tabs(["Backtest", "Screener"])
+regime_ctx = None  # filled by the Backtest tab, read by the Regimes tab
+tabs = st.tabs(["Backtest", "Regimes", "Screener"])
 
 with tabs[0]:
     # Main Content
@@ -1023,6 +1025,12 @@ with tabs[0]:
                                         st.plotly_chart(fig_beta_reg, use_container_width=True)
                                     elif beta is None:
                                         st.info(f"Not enough overlapping {beta_freq_label.lower()} observations in this date range to compute beta.")
+
+                            regime_ctx = dict(dep=dependent_var, raw_mask=original_matching_mask, raw_dates=cluster_free_dates,
+                                              fwd=forward_returns_all, suffix=forward_return_suffix, horizons=horizons,
+                                              direction=expected_direction, cluster_days=cluster_free_days,
+                                              prec=change_display_precision, unit=change_value_suffix, metric=change_metric_name,
+                                              start=start_date)
 
                             # Cluster-Free Forward Return Analysis
                             if forward_returns_cluster_free and any(not df.empty for df in forward_returns_cluster_free.values()):
@@ -1820,6 +1828,172 @@ with tabs[0]:
         Configure your analysis in the sidebar and click **"Calculate & Plot"** to begin.
         """)
 with tabs[1]:
+    st.header("Market Regimes")
+    if regime_ctx is None:
+        st.info("Run **Calculate & Plot** first: this tab conditions the same backtest's signals on market regimes.")
+    else:
+        rc = regime_ctx
+        dep, fwd, sfx, hz = rc["dep"], rc["fwd"], rc["suffix"], rc["horizons"]
+        fmt = f"%.{rc['prec']}f{rc['unit']}"
+        win = (lambda s: (s > 0).mean() * 100) if rc["direction"] == "Increase" else (lambda s: (s < 0).mean() * 100)
+
+        # ---- controls
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            regime_window = st.radio("Rate-of-change window", list(regimes.WINDOWS), index=1, horizontal=True, key="regime_window",
+                                     help="Window for the 'change' regimes (curve dynamics, Δ2y, 10y trend, dollar, custom driver). "
+                                          "Thresholds are set for 3M and scaled by √time for 1M/6M.")
+        with c2:
+            with st.expander("Custom driver regime", expanded=False):
+                regime_use_custom = st.checkbox("Add a custom driver", key="regime_use_custom",
+                                                help="Bucket any driver by its trailing 5-year percentile rank, or by rising/falling.")
+                regime_custom = None
+                if regime_use_custom:
+                    k1, k2, k3 = st.columns(3)
+                    c_driver = k1.selectbox("Driver", list(regimes.DRIVERS), key="regime_c_driver")
+                    c_tr = k2.radio("Transform", ["Level", "Change over window"], key="regime_c_tr")
+                    c_b = k3.selectbox("Buckets", list(regimes.CUSTOM_BUCKETS), index=1, key="regime_c_b")
+                    regime_custom = {"driver": c_driver, "transform": c_tr, "bucket": c_b}
+                    st.caption(f"Custom: {regimes.custom_label_name(regime_custom, regime_window)}")
+        regime_families = list(regimes.FAMILIES) + ([regimes.CUSTOM] if regime_custom else [])
+
+        regime_L = None
+        try:
+            with st.spinner("Loading market regimes (FRED + Yahoo)..."):
+                regime_drv = regimes.drivers(str(pd.Timestamp(rc["start"]).date()))
+                regime_L_full = regimes.labels(regime_drv, regimes.WINDOWS[regime_window], regime_custom)
+            regime_L = (regime_L_full.reindex(regime_L_full.index.union(dep.index)).ffill(limit=5).reindex(dep.index))
+        except Exception as regime_err:
+            st.error(f"Market regimes unavailable ({type(regime_err).__name__}: {regime_err}).")
+
+        if regime_L is not None:
+            # ---- today's regime
+            st.subheader("Today's regime")
+            cur = regimes.current(regime_drv, regime_L_full, regime_window)
+            card_cols = st.columns(5)
+            for k, r in cur.iterrows():
+                colr = regimes.FAMILIES[r["Regime family"]].get(r["Today"], "#888")
+                with card_cols[k % 5]:
+                    st.markdown(
+                        f"<div style='border-left:4px solid {colr};padding:4px 8px;margin-bottom:8px'>"
+                        f"<div style='font-size:11px;opacity:.7'>{r['Regime family']}</div>"
+                        f"<div style='font-weight:600;color:{colr}'>{r['Today'] or 'n/a'}</div>"
+                        f"<div style='font-size:11px;opacity:.7'>{r['Reading']}</div></div>", unsafe_allow_html=True)
+            st.caption(f"As of {regime_drv.index[-1].date()}. CPI and unemployment are as published (~45 and ~35 days after the "
+                       "reference month), so every label matches what was knowable on that day.")
+            if (dep.index[-1] - dep.index[0]).days < 5 * 365:
+                st.warning("Under 5 years of history: most regimes only appear once or twice. Move the start date back for a meaningful split.")
+
+            # ---- regime filter: raw signals vs regime-filtered signals
+            st.subheader("Regime filter")
+            n_rf = st.number_input("Regime filters (AND-ed)", min_value=0, max_value=3, value=1, key="regime_n")
+            regime_filters = []
+            if n_rf:
+                fcols = st.columns(int(n_rf))
+                for j in range(int(n_rf)):
+                    with fcols[j]:
+                        fam = st.selectbox(f"Regime {j + 1}", regime_families, key=f"regime_fam_{j}")
+                        sts = st.multiselect("Only signal when in", list(regimes.states_for(fam, regime_custom)), key=f"regime_states_{j}")
+                        st.caption(regimes.DESCRIPTIONS.get(fam, "Custom driver bucketed point-in-time."))
+                        if sts:
+                            regime_filters.append((fam, sts))
+            raw_mask = rc["raw_mask"]
+            filt_mask = raw_mask.copy()
+            for fam, sts in regime_filters:
+                filt_mask &= regime_L[fam].isin(sts).reindex(raw_mask.index, fill_value=False)
+            filt_mask, _ = apply_cluster_free_filter(filt_mask, rc["cluster_days"])
+            raw_dates, filt_dates = rc["raw_dates"], dep.index[filt_mask]
+            out_dates = raw_dates.difference(filt_dates)
+
+            if regime_filters:
+                st.markdown("**Filter:** " + " AND ".join(f"{f} ∈ {{{', '.join(s)}}}" for f, s in regime_filters))
+                rows = []
+                for h in hz:
+                    s = fwd[f"Forward_{h}D_{sfx}"]
+                    row = {"Horizon": f"{h}D"}
+                    for name, dts in (("Raw", raw_dates), ("In regime", filt_dates), ("Filtered out", out_dates)):
+                        x = s.reindex(dts).dropna()
+                        row[f"{name} n"] = len(x)
+                        row[f"{name} avg"] = x.mean() if len(x) else np.nan
+                        row[f"{name} win %"] = win(x) if len(x) else np.nan
+                    rows.append(row)
+                cmp_df = pd.DataFrame(rows)
+                st.dataframe(cmp_df, use_container_width=True, hide_index=True, column_config={
+                    **{c: st.column_config.NumberColumn(format=fmt) for c in cmp_df.columns if c.endswith(" avg")},
+                    **{c: st.column_config.NumberColumn(format="%.0f%%") for c in cmp_df.columns if c.endswith("win %")}})
+                st.caption("Raw = the Backtest tab's signals (cluster-free set). In regime = those that also pass the filter; "
+                           "filtered out = the rest. Same cooldown applied to the filtered set.")
+            else:
+                st.caption("Pick regime states above to compare the raw signal against the regime-filtered one.")
+
+            # ---- split by regime
+            st.subheader("Split by regime")
+            sp1, sp2, sp3 = st.columns([1.6, 1, 1])
+            with sp1:
+                regime_split = st.selectbox("Split results by", regime_families, key="regime_split")
+            with sp2:
+                h = st.radio("Horizon", hz, horizontal=True, key="regime_h", format_func=lambda v: f"{v}D")
+            with sp3:
+                which = st.radio("Signals", ["Raw", "In regime"], horizontal=True, key="regime_which",
+                                 disabled=not regime_filters)
+            split_states = regimes.states_for(regime_split, regime_custom)
+            st.caption(regimes.DESCRIPTIONS.get(regime_split, regimes.custom_label_name(regime_custom, regime_window) if regime_custom else ""))
+            sig_dates = filt_dates if (which == "In regime" and regime_filters) else raw_dates
+            bd = regimes.breakdown(regime_L[regime_split], fwd, sig_dates, hz, sfx, rc["direction"], split_states)
+            today_state = regime_L[regime_split].iloc[-1]
+            tbl = pd.DataFrame({
+                "Regime": [f"{s}  ◀ today" if s == today_state else s for s in bd.Regime],
+                "% of days": bd["% of days"], "Signals": bd.Signals,
+                "Signal avg": bd[f"{h}D signal avg"], "Signal win %": bd[f"{h}D signal win %"],
+                "Baseline avg": bd[f"{h}D base avg"], "Baseline win %": bd[f"{h}D base win %"],
+                "Edge (signal − base)": bd[f"{h}D edge"],
+            })
+            st.dataframe(tbl, use_container_width=True, hide_index=True, column_config={
+                "% of days": st.column_config.NumberColumn(format="%.0f%%"),
+                "Signal avg": st.column_config.NumberColumn(format=fmt), "Baseline avg": st.column_config.NumberColumn(format=fmt),
+                "Edge (signal − base)": st.column_config.NumberColumn(format=fmt),
+                "Signal win %": st.column_config.NumberColumn(format="%.0f%%"), "Baseline win %": st.column_config.NumberColumn(format="%.0f%%"),
+            })
+            plot_bd = bd[bd.Regime != "All regimes"]
+            if not plot_bd.empty:
+                fig_rg = go.Figure()
+                fig_rg.add_trace(go.Bar(x=plot_bd.Regime, y=plot_bd[f"{h}D base avg"], name="Baseline (all days in regime)", marker_color="#6c7a89"))
+                fig_rg.add_trace(go.Bar(x=plot_bd.Regime, y=plot_bd[f"{h}D signal avg"], name="Signal days",
+                                        marker_color=[split_states.get(s, "#888") for s in plot_bd.Regime],
+                                        text=[f"n={n}" for n in plot_bd.Signals], textposition="outside", cliponaxis=False))
+                fig_rg.update_layout(barmode="group", height=360, template="plotly_dark", margin=dict(t=80),
+                                     title=dict(text=f"Avg {h}D forward change by {regime_split.lower()}", x=0.5, xanchor="center"),
+                                     yaxis_title=f"{rc['metric']} change", legend=dict(orientation="h", y=1.1, x=0))
+                st.plotly_chart(fig_rg, use_container_width=True)
+            thin = plot_bd[plot_bd.Signals < 10].Regime.tolist()
+            st.caption("Baseline = every trading day in that regime at the same horizon, so the edge strips out each regime's own drift. "
+                       "Forward windows overlap, so the effective sample is smaller than n."
+                       + (f" Fewer than 10 signals in: {', '.join(thin)}." if thin else ""))
+
+            # ---- chart shaded by the split regime
+            fig_rs = go.Figure()
+            segs = regimes.segments(regime_L[regime_split])
+            if len(segs) <= 500:
+                for a, b, s in segs:
+                    fig_rs.add_vrect(x0=a, x1=b + pd.Timedelta(days=1), fillcolor=split_states.get(s, "#888"),
+                                     opacity=0.18, layer="below", line_width=0)
+            fig_rs.add_trace(go.Scatter(x=dep.index, y=dep.values, mode="lines", name="Dependent Variable", line=dict(color="#636EFA", width=1.5)))
+            fig_rs.add_trace(go.Scatter(x=raw_dates, y=dep.reindex(raw_dates), mode="markers", name="Raw signals",
+                                        marker=dict(color="#9aa0a6", size=5, symbol="circle-open")))
+            if regime_filters:
+                fig_rs.add_trace(go.Scatter(x=filt_dates, y=dep.reindex(filt_dates), mode="markers", name="In-regime signals",
+                                            marker=dict(color="#FF6B6B", size=8)))
+            fig_rs.update_layout(template="plotly_dark", height=520, margin=dict(t=70),
+                                 title=dict(text=f"Dependent variable shaded by {regime_split.lower()}", x=0.5, xanchor="center"),
+                                 legend=dict(orientation="h", y=1.08, x=0))
+            st.plotly_chart(fig_rs, use_container_width=True)
+            if len(segs) <= 500:
+                st.markdown(" ".join(f"<span style='background:{c};opacity:.85;color:#111;padding:1px 6px;border-radius:3px;font-size:12px'>{s}</span>"
+                                     for s, c in split_states.items()), unsafe_allow_html=True)
+            else:
+                st.caption(f"{regime_split} flips {len(segs)} times over this range - too choppy to shade; try a longer window.")
+
+with tabs[2]:
     st.header("Multi-Horizon Screener")
     st.caption("1M / 3M / 6M / 12M % return and z-score (vs. each instrument's own trailing range) "
                "across a fixed ticker universe, grouped by asset class - independent of the Backtest "
